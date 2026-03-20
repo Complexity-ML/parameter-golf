@@ -663,11 +663,6 @@ class TokenRoutedMLP(nn.Module):
     def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
         bsz, seq, _ = x.shape
         flat_x = x.reshape(-1, self.dim)
-        # Try CUDA scatter dispatch for modulo routing (4x faster, no wasted compute)
-        kernel = _load_i64_moe() if self.routing == "modulo" and not self.training else None
-        if kernel is not None and self.activation == "swiglu":
-            token_ids_flat = expert_ids.reshape(-1).to(torch.int64)
-            return kernel.forward(flat_x.half(), token_ids_flat, self.gate_up_proj.half(), self.down_proj.half(), self.num_experts).to(flat_x.dtype).reshape(bsz, seq, self.dim)
         # Mask multiply: fullgraph=True safe, torch.compile unrolls the loop
         flat_ids = expert_ids.reshape(-1)
         weights = F.one_hot(flat_ids, self.num_experts).to(flat_x.dtype)
