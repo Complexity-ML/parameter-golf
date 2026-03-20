@@ -668,20 +668,19 @@ class TokenRoutedMLP(nn.Module):
         if kernel is not None and self.activation == "swiglu":
             token_ids_flat = expert_ids.reshape(-1).to(torch.int64)
             return kernel.forward(flat_x.half(), token_ids_flat, self.gate_up_proj.half(), self.down_proj.half(), self.num_experts).to(flat_x.dtype).reshape(bsz, seq, self.dim)
-        # Real scatter dispatch: only compute active expert per token (no wasted compute)
+        # Mask multiply: fullgraph=True safe, torch.compile unrolls the loop
         flat_ids = expert_ids.reshape(-1)
+        weights = F.one_hot(flat_ids, self.num_experts).to(flat_x.dtype)
         out = torch.zeros_like(flat_x)
         for e in range(self.num_experts):
-            mask = flat_ids == e
-            if not mask.any(): continue
-            xe = flat_x[mask]
+            w = weights[:, e].unsqueeze(-1)
             if self.activation == "swiglu":
-                gu = xe @ self.gate_up_proj[e]
+                gu = flat_x @ self.gate_up_proj[e]
                 gate, up = gu.chunk(2, dim=-1)
-                out[mask] = (F.silu(gate) * up) @ self.down_proj[e]
+                out = out + (F.silu(gate) * up @ self.down_proj[e]) * w
             else:
-                h = torch.relu(xe @ self.fc_weight[e])
-                out[mask] = h.square() @ self.proj_weight[e]
+                h = torch.relu(flat_x @ self.fc_weight[e])
+                out = out + (h.square() @ self.proj_weight[e]) * w
         return out.reshape(bsz, seq, self.dim)
 
 class Block(nn.Module):
@@ -1151,7 +1150,7 @@ def main() -> None:
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
