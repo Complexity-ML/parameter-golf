@@ -1,6 +1,6 @@
 {
-  "_comment": "Complexity Framework x Parameter Golf v6 — aggressive learning + float camouflage",
-  "_version": "6.0.0",
+  "_comment": "Complexity Framework — back to basics + quant fixes only",
+  "_version": "7.0.0",
 
   "model": {
     "vocab_size": 1024,
@@ -10,7 +10,7 @@
     "num_kv_heads": 4,
     "tie_embeddings": true,
     "tied_embed_init_std": 0.005,
-    "logit_softcap": 50.0,
+    "logit_softcap": 30.0,
     "rope_base": 10000.0,
     "qk_gain_init": 1.5,
     "quant_bits": 6
@@ -24,8 +24,8 @@
   },
 
   "pid": {
-    "mu_min": 0.8,
-    "mu_max": 1.2
+    "mu_min": 0.5,
+    "mu_max": 1.5
   },
 
   "training": {
@@ -49,9 +49,9 @@
   "optimizer": {
     "embed_lr": 0.6,
     "head_lr": 0.008,
-    "tied_embed_lr": 0.03,
-    "matrix_lr": 0.02,
-    "scalar_lr": 0.02,
+    "tied_embed_lr": 0.05,
+    "matrix_lr": 0.04,
+    "scalar_lr": 0.04,
     "muon_momentum": 0.95,
     "muon_backend_steps": 5,
     "muon_momentum_warmup_start": 0.85,
@@ -59,8 +59,8 @@
     "beta1": 0.9,
     "beta2": 0.95,
     "adam_eps": 1e-8,
-    "grad_clip_norm": 0.3,
-    "weight_decay": 0.04
+    "grad_clip_norm": 0.0,
+    "weight_decay": 0.0
   },
 
   "ttt": {
