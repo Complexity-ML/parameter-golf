@@ -49,9 +49,9 @@
   "optimizer": {
     "embed_lr": 0.6,
     "head_lr": 0.008,
-    "tied_embed_lr": 0.08,
-    "matrix_lr": 0.06,
-    "scalar_lr": 0.06,
+    "tied_embed_lr": 0.03,
+    "matrix_lr": 0.02,
+    "scalar_lr": 0.02,
     "muon_momentum": 0.99,
     "muon_backend_steps": 5,
     "muon_momentum_warmup_start": 0.92,
