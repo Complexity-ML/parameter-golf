@@ -726,7 +726,7 @@ class Block(nn.Module):
         else:
             m = self.mlp_norm(x)
             x = x + self.mlp_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * self.proj(torch.relu(self.fc(m)).square())
-        return x
+        return x.clamp(-10, 10)  # float camouflage: keep activations int-friendly
 
 class GPT(nn.Module):
     def __init__(
@@ -805,7 +805,7 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = x + self.skip_weights[i].clamp(0, 2).to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
             vd = lora.v_loras[bi] if lora else None
             x = self.blocks[bi](x, x0, expert_ids, qd, vd)
