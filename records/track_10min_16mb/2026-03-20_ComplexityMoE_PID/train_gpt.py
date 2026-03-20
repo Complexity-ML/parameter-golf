@@ -702,7 +702,14 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = TokenRoutedMLP(dim, mlp_mult, num_experts, moe_activation, moe_routing)
+        self.use_moe = num_experts > 1
+        if self.use_moe:
+            self.mlp = TokenRoutedMLP(dim, mlp_mult, num_experts, moe_activation, moe_routing)
+        else:
+            hidden = mlp_mult * dim
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
+            self.proj._zero_init = True
         self.pid = PIDDynamics(dim, pid_alpha, pid_beta, pid_gate, pid_dt,
                                pid_mu_min, pid_mu_max, pid_velocity_max)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -718,10 +725,12 @@ class Block(nn.Module):
         vd = v_delta_fn(n) if v_delta_fn is not None else None
         attn_out = self.attn(n, qd, vd)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        # PID dynamics after attention, before MLP
         x, vel = self.pid(x, vel)
-        # Token-Routed MoE
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), expert_ids)
+        if self.use_moe:
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), expert_ids)
+        else:
+            m = self.mlp_norm(x)
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.proj(torch.relu(self.fc(m)).square())
         return x, vel
 
 class GPT(nn.Module):
