@@ -525,10 +525,35 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
+# QAT: fake quantize with straight-through estimator (STE)
+def _fake_quantize(w: Tensor, bits: int = QUANT_BITS) -> Tensor:
+    """Simulate quantization during training. Gradients flow through via STE."""
+    qmax = (1 << (bits - 1)) - 1
+    orig_shape = w.shape
+    if w.ndim == 3:
+        w_flat = w.reshape(-1, w.shape[-1])
+    else:
+        w_flat = w
+    if w_flat.ndim == 2:
+        scale = w_flat.detach().abs().amax(dim=-1, keepdim=True) / qmax
+        scale = scale.clamp_min(1.0 / qmax)
+        q = (w_flat / scale).round().clamp(-qmax, qmax)
+        out = q * scale
+    else:
+        scale = w.detach().abs().amax() / qmax
+        scale = scale.clamp_min(1.0 / qmax)
+        q = (w / scale).round().clamp(-qmax, qmax)
+        out = q * scale
+    if w.ndim == 3 and w_flat.ndim == 2:
+        out = out.reshape(orig_shape)
+    # STE: forward uses quantized, backward uses original gradients
+    return w + (out - w).detach()
+
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
+        w = _fake_quantize(self.weight) if self.training else self.weight
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     with torch.no_grad():
@@ -666,16 +691,20 @@ class TokenRoutedMLP(nn.Module):
         flat_x = x.reshape(-1, self.dim)
         flat_ids = expert_ids.reshape(-1)
         weights = F.one_hot(flat_ids, self.num_experts).to(flat_x.dtype)  # [N, E]
-        # Batched einsum: all experts in 1-2 fused kernels instead of E separate matmuls
+        # QAT: fake quantize expert weights during training
         if self.activation == "swiglu":
-            all_gu = torch.einsum('nd,edi->nei', flat_x, self.gate_up_proj)  # [N, E, 2*inter]
+            gu_w = _fake_quantize(self.gate_up_proj) if self.training else self.gate_up_proj
+            dn_w = _fake_quantize(self.down_proj) if self.training else self.down_proj
+            all_gu = torch.einsum('nd,edi->nei', flat_x, gu_w)  # [N, E, 2*inter]
             gate, up = all_gu.chunk(2, dim=-1)
             inter = F.silu(gate) * up
-            all_out = torch.einsum('nei,eid->ned', inter, self.down_proj)  # [N, E, dim]
+            all_out = torch.einsum('nei,eid->ned', inter, dn_w)  # [N, E, dim]
         else:
-            h = torch.einsum('nd,edi->nei', flat_x, self.fc_weight)  # [N, E, inter]
+            fc_w = _fake_quantize(self.fc_weight) if self.training else self.fc_weight
+            pj_w = _fake_quantize(self.proj_weight) if self.training else self.proj_weight
+            h = torch.einsum('nd,edi->nei', flat_x, fc_w)  # [N, E, inter]
             h = torch.relu(h).square()
-            all_out = torch.einsum('nei,eid->ned', h, self.proj_weight)  # [N, E, dim]
+            all_out = torch.einsum('nei,eid->ned', h, pj_w)  # [N, E, dim]
         out = (all_out * weights.unsqueeze(-1)).sum(dim=1)  # [N, dim]
         return out.reshape(bsz, seq, self.dim)
 

@@ -13,7 +13,7 @@
     "logit_softcap": 30.0,
     "rope_base": 10000.0,
     "qk_gain_init": 1.5,
-    "quant_bits": 6
+    "quant_bits": 8
   },
 
   "moe": {
