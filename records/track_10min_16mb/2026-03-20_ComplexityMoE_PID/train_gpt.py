@@ -1217,35 +1217,35 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        # Cosine Warm Restarts (SGDR) — cycles get longer, peak decays each restart.
-        # Cycles: T0, T0*mult, T0*mult^2, ... Peak LR: 1.0, decay, decay^2, ...
+        # Dynamic Cosine Warm Restarts — adapts to wallclock, never spikes near end
         if args.lr_schedule == "cosine_restarts" and step > 0:
-            T0 = args.lr_restart_base_period
-            Tmult = args.lr_restart_mult
             decay = args.lr_restart_decay
             min_r = args.lr_min_ratio
-            # Find which cycle we're in and position within it
-            t_accum, cycle = 0, 0
-            T_cur = T0
-            while t_accum + T_cur <= step:
-                t_accum += T_cur
-                T_cur = int(T_cur * Tmult)
-                cycle += 1
-            pos_in_cycle = step - t_accum
-            # Peak LR decays each cycle
-            peak = decay ** cycle
-            # Cosine annealing within cycle: peak → min_ratio * peak
+            step_ms = elapsed_ms / max(step, 1)
+            total_steps = int(max_wallclock_ms / step_ms) if max_wallclock_ms else args.iterations
+            # Build cycles that FIT in total_steps (no spike at the end)
+            Tmult = args.lr_restart_mult
+            T0 = max(int(total_steps / 15), 10)  # first cycle ~7% of total
+            cycles = []
+            T_cur, accum = T0, 0
+            while accum + T_cur <= total_steps:
+                cycles.append((accum, T_cur))
+                accum += T_cur
+                T_cur = max(int(T_cur * Tmult), 1)
+            if not cycles:
+                cycles = [(0, total_steps)]
+            # Last cycle stretches to exactly total_steps (smooth landing)
+            last_start, _ = cycles[-1]
+            cycles[-1] = (last_start, total_steps - last_start)
+            # Find which cycle this step is in
+            cycle_idx, pos_in_cycle, T_cur = 0, step, cycles[0][1]
+            for ci, (cs, cl) in enumerate(cycles):
+                if step >= cs and (ci == len(cycles)-1 or step < cycles[ci+1][0]):
+                    cycle_idx, pos_in_cycle, T_cur = ci, step - cs, cl
+                    break
+            peak = decay ** cycle_idx
             cos_val = 0.5 * (1.0 + math.cos(math.pi * pos_in_cycle / max(T_cur, 1)))
-            scale = min_r + (1.0 - min_r) * cos_val
-            lr_scale = peak * scale
-            # Final warmdown override near wallclock limit
-            if max_wallclock_ms is not None:
-                remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-                step_ms = elapsed_ms / max(step, 1)
-                warmdown_ms = args.warmdown_iters * step_ms
-                if remaining_ms <= warmdown_ms:
-                    lr_scale = min(lr_scale, remaining_ms / max(warmdown_ms, 1e-9))
-            return lr_scale
+            return peak * (min_r + (1.0 - min_r) * cos_val)
         # Fallback: original warmdown schedule
         if args.warmdown_iters <= 0:
             return 1.0
