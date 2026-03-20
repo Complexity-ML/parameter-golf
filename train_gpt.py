@@ -1041,7 +1041,7 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    base_accum = int(os.environ.get("GRAD_ACCUM_STEPS", "8"))
+    base_accum = int(os.environ.get("GRAD_ACCUM_STEPS", str(_T.get("grad_accum_steps", 8))))
     if base_accum % world_size != 0:
         raise ValueError(f"GRAD_ACCUM_STEPS={base_accum} must be divisible by WORLD_SIZE={world_size}")
     grad_accum_steps = base_accum // world_size
