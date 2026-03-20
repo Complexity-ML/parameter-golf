@@ -21,6 +21,19 @@ import zlib
 from pathlib import Path
 try: import zstandard as zstd; USE_ZSTD = True
 except ImportError: USE_ZSTD = False
+# JIT-compile CUDA kernel for scatter dispatch MoE (falls back to PyTorch mask multiply)
+_I64_MOE = None
+def _load_i64_moe():
+    global _I64_MOE
+    if _I64_MOE is not None: return _I64_MOE
+    for p in [os.path.join(os.path.dirname(__file__), "i64_moe_kernel.cu"), os.path.join(os.path.dirname(__file__), "records", "track_10min_16mb", "2026-03-20_ComplexityMoE_PID", "i64_moe_kernel.cu")]:
+        if os.path.isfile(p):
+            try:
+                from torch.utils.cpp_extension import load
+                _I64_MOE = load("i64_moe", sources=[p], extra_cuda_cflags=["-O3", "--use_fast_math"], verbose=False)
+            except Exception: pass
+            break
+    return _I64_MOE
 
 import numpy as np
 import sentencepiece as spm
@@ -127,8 +140,6 @@ class Hyperparameters:
 # MUON OPTIMIZER (from modded-nanogpt)
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -187,7 +198,6 @@ class Muon(torch.optim.Optimizer):
                     if g.ndim == 3:
                         g = g.reshape(g.size(0) * g.size(1), g.size(2))
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     if len(orig_shape) == 3:
                         g = g.reshape(orig_shape)
@@ -235,7 +245,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
@@ -254,9 +263,6 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -459,8 +465,6 @@ def load_data_shard(file: Path) -> Tensor:
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -489,8 +493,6 @@ class TokenStream:
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -516,20 +518,17 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -664,6 +663,12 @@ class TokenRoutedMLP(nn.Module):
     def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
         bsz, seq, _ = x.shape
         flat_x = x.reshape(-1, self.dim)
+        # Try CUDA scatter dispatch for modulo routing (4x faster, no wasted compute)
+        kernel = _load_i64_moe() if self.routing == "modulo" and not self.training else None
+        if kernel is not None and self.activation == "swiglu":
+            token_ids_flat = expert_ids.reshape(-1).to(torch.int64)
+            return kernel.forward(flat_x.half(), token_ids_flat, self.gate_up_proj.half(), self.down_proj.half(), self.num_experts).to(flat_x.dtype).reshape(bsz, seq, self.dim)
+        # Fallback: soft routing (mask multiply, fullgraph safe)
         if self.routing == "learned":
             weights = self.router(flat_x)
         elif self.routing == "hybrid":
@@ -1067,7 +1072,6 @@ def main() -> None:
         dist.barrier()
     master_process = rank == 0
 
-    # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -1402,7 +1406,6 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
-        # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
@@ -1421,9 +1424,6 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
