@@ -1,11 +1,11 @@
 {
-  "_comment": "Complexity Framework x Parameter Golf v2 — Token-Routed I64 + PID + Learned Router",
-  "_version": "2.0.0",
+  "_comment": "Complexity Framework x Parameter Golf v5 — MoE + MuDynamics (no PID velocity)",
+  "_version": "5.0.0",
 
   "model": {
     "vocab_size": 1024,
-    "num_layers": 11,
-    "_params_comment": "11L + MLP 2x + 4 experts SwiGLU = ~26.5M params, ~14.2MB with int6+zstd",
+    "num_layers": 9,
+    "_params_comment": "9L + MLP 2x + 4 experts relu2 = ~17M params",
     "model_dim": 512,
     "num_heads": 8,
     "num_kv_heads": 4,
@@ -19,21 +19,14 @@
 
   "moe": {
     "num_experts": 4,
-    "activation": "swiglu",
-    "routing": "hybrid",
-    "_comment": "4 experts SwiGLU, mlp2x = 26.5M params fits 16MB with int6+zstd",
+    "activation": "relu2",
+    "routing": "modulo",
     "mlp_mult": 2
   },
 
   "pid": {
-    "alpha": 0.95,
-    "beta": 0.3,
-    "gate": 0.1,
-    "dt": 0.1,
     "mu_min": 0.5,
-    "mu_max": 1.5,
-    "velocity_max": 3.0,
-    "_comment": "effective step = dt * gate = 0.01, mu learnable per layer, v traverses all layers"
+    "mu_max": 1.5
   },
 
   "training": {
@@ -48,7 +41,6 @@
     "lr_restart_mult": 2.0,
     "lr_restart_decay": 0.7,
     "lr_min_ratio": 0.01,
-    "_lr_comment": "Cycles: 5k, 10k, 20k... Peak LR decays 0.7x each restart. Min LR = 1% of peak.",
     "seed": 1337,
     "val_loss_every": 1000,
     "val_batch_size": 524288,
