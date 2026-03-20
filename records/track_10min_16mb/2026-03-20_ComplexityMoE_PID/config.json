@@ -17,7 +17,7 @@
   },
 
   "moe": {
-    "num_experts": 4,
+    "num_experts": 1,
     "activation": "relu2",
     "routing": "modulo",
     "mlp_mult": 2
@@ -34,7 +34,7 @@
     "train_seq_len": 1024,
     "max_wallclock_seconds": 600.0,
     "warmup_steps": 20,
-    "warmdown_iters": 1200,
+    "warmdown_iters": 3000,
     "lr_schedule": "cosine_restarts",
     "lr_restart_base_period": 250,
     "lr_restart_mult": 2.0,
@@ -49,9 +49,9 @@
   "optimizer": {
     "embed_lr": 0.6,
     "head_lr": 0.008,
-    "tied_embed_lr": 0.05,
-    "matrix_lr": 0.04,
-    "scalar_lr": 0.04,
+    "tied_embed_lr": 0.03,
+    "matrix_lr": 0.02,
+    "scalar_lr": 0.02,
     "muon_momentum": 0.95,
     "muon_backend_steps": 5,
     "muon_momentum_warmup_start": 0.85,
@@ -59,7 +59,7 @@
     "beta1": 0.9,
     "beta2": 0.95,
     "adam_eps": 1e-8,
-    "grad_clip_norm": 0.0,
+    "grad_clip_norm": 0.3,
     "weight_decay": 0.0
   },
 
