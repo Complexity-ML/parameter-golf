@@ -13,3 +13,4 @@ logs/
 dashboard.html
 strategy-*.html
 test_model.py
+benchmark-results.html
