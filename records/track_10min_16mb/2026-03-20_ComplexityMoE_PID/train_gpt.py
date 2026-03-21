@@ -608,64 +608,41 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
-# Token-Routed MoE — modulo routing, gather/scatter dispatch.
-# @torch.compiler.disable on forward: Inductor skips this module,
-# compiles everything else (attention, norms). Real routing, no waste.
+# Soft MoE — all experts compute all tokens in parallel (one einsum),
+# soft router blends results. Zero waste, fullgraph safe, GPU saturated.
+class SoftMoERouter(nn.Module):
+    def __init__(self, dim: int, num_experts: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, num_experts, bias=False)
+        nn.init.normal_(self.proj.weight, std=0.01)
+    def forward(self, x: Tensor) -> Tensor:
+        return F.softmax(self.proj(x), dim=-1)  # [bsz, seq, E]
+
 class TokenRoutedMLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, num_experts: int,
                  activation: str = "relu2"):
         super().__init__()
         self.num_experts, self.dim, self.activation = num_experts, dim, activation
         self.expert_inter = (mlp_mult * dim) // num_experts
-        if activation == "swiglu":
-            self.gate_up_proj = nn.Parameter(torch.empty(num_experts, dim, 2 * self.expert_inter))
-            self.down_proj = nn.Parameter(torch.empty(num_experts, self.expert_inter, dim))
-        else:
-            self.fc_weight = nn.Parameter(torch.empty(num_experts, dim, self.expert_inter))
-            self.proj_weight = nn.Parameter(torch.empty(num_experts, self.expert_inter, dim))
+        self.fc_weight = nn.Parameter(torch.empty(num_experts, dim, self.expert_inter))
+        self.proj_weight = nn.Parameter(torch.empty(num_experts, self.expert_inter, dim))
+        self.router = SoftMoERouter(dim, num_experts)
         self._init_weights()
 
     def _init_weights(self):
-        if self.activation == "swiglu":
-            nn.init.kaiming_uniform_(self.gate_up_proj, a=5**0.5)
-            nn.init.zeros_(self.down_proj)
-        else:
-            nn.init.kaiming_uniform_(self.fc_weight, a=5**0.5)
-            nn.init.zeros_(self.proj_weight)
+        nn.init.kaiming_uniform_(self.fc_weight, a=5**0.5)
+        nn.init.zeros_(self.proj_weight)
 
-    @torch.compiler.disable
-    def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seq, _ = x.shape
-        flat_x = x.reshape(-1, self.dim)
-        flat_ids = expert_ids.reshape(-1)
-        out = torch.zeros_like(flat_x)
-        # Gather tokens per expert
-        indices = []
-        inputs = []
-        for e in range(self.num_experts):
-            idx = (flat_ids == e).nonzero(as_tuple=True)[0]
-            indices.append(idx)
-            inputs.append(flat_x[idx] if idx.numel() > 0 else None)
-        # Launch all experts in parallel on separate CUDA streams
-        streams = [torch.cuda.Stream() for _ in range(self.num_experts)]
-        results = [None] * self.num_experts
-        for e in range(self.num_experts):
-            if inputs[e] is None:
-                continue
-            with torch.cuda.stream(streams[e]):
-                x_e = inputs[e]
-                if self.activation == "swiglu":
-                    gu = x_e @ self.gate_up_proj[e]
-                    gate, up = gu.chunk(2, dim=-1)
-                    results[e] = F.silu(gate) * up @ self.down_proj[e]
-                else:
-                    h = torch.relu(x_e @ self.fc_weight[e])
-                    results[e] = h.square() @ self.proj_weight[e]
-        # Sync all streams and scatter results back
-        for e in range(self.num_experts):
-            streams[e].synchronize()
-            if results[e] is not None:
-                out[indices[e]] = results[e]
+        flat_x = x.reshape(-1, self.dim)  # [N, D]
+        # All experts, all tokens, one batched op — GPU fully parallel
+        all_h = torch.einsum('nd,edi->nei', flat_x, self.fc_weight)   # [N, E, I]
+        all_h = torch.relu(all_h).square()
+        all_out = torch.einsum('nei,eid->ned', all_h, self.proj_weight)  # [N, E, D]
+        # Soft router blends expert outputs — every expert contributes
+        w = self.router(x).reshape(-1, self.num_experts)  # [N, E]
+        out = (all_out * w.unsqueeze(-1)).sum(dim=1)       # [N, D]
         return out.reshape(bsz, seq, self.dim)
 
 class Block(nn.Module):
@@ -696,7 +673,7 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, expert_ids: Tensor,
+    def forward(self, x: Tensor, x0: Tensor,
                 q_delta_fn=None, v_delta_fn=None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -706,7 +683,7 @@ class Block(nn.Module):
         attn_out = self.attn(n, qd, vd)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         if self.use_moe:
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), expert_ids)
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         else:
             m = self.mlp_norm(x)
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.proj(torch.relu(self.fc(m)).square())
@@ -742,11 +719,6 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        # Deterministic modulo routing: token_id % num_experts
-        self.register_buffer(
-            "token_to_expert",
-            torch.arange(vocab_size, dtype=torch.long) % num_experts,
-        )
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -774,12 +746,11 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
-        expert_ids = self.token_to_expert[input_ids.clamp(0, self.vocab_size - 1)]
 
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, expert_ids, qd, vd)
+            x = self.blocks[i](x, x0, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -787,7 +758,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
             vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, expert_ids, qd, vd)
+            x = self.blocks[bi](x, x0, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
@@ -1117,7 +1088,7 @@ def main() -> None:
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
