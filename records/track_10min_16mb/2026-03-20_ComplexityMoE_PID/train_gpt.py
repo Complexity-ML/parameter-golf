@@ -692,20 +692,20 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor,
                 q_delta_fn=None, v_delta_fn=None) -> Tensor:
-        mix = self.resid_mix.clamp(0, 1).to(dtype=x.dtype)
+        mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
         attn_out = self.attn(n, qd, vd)
-        x = x + self.attn_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         if self.use_moe:
             m = self.mlp_norm(x)
             expert_ids = self.mlp.router(m)  # hard routing, detached
-            x = x + self.mlp_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * self.mlp(m, expert_ids)
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(m, expert_ids)
         else:
             m = self.mlp_norm(x)
-            x = x + self.mlp_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * self.proj(torch.relu(self.fc(m)).square())
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.proj(torch.relu(self.fc(m)).square())
         return x
 
 class GPT(nn.Module):
@@ -775,7 +775,7 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].clamp(0, 2).to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
             vd = lora.v_loras[bi] if lora else None
             x = self.blocks[bi](x, x0, qd, vd)
@@ -1187,52 +1187,16 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    lr_warmup_steps = 50
-
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        # Linear LR warmup: 0 → peak over first N steps
-        warmup_mul = min(step / max(lr_warmup_steps, 1), 1.0) if step < lr_warmup_steps else 1.0
-        # Dynamic Cosine Warm Restarts — adapts to wallclock, never spikes near end
-        if args.lr_schedule == "cosine_restarts" and step > 0:
-            decay = args.lr_restart_decay
-            min_r = args.lr_min_ratio
-            step_ms = elapsed_ms / max(step, 1)
-            total_steps = int(max_wallclock_ms / step_ms) if max_wallclock_ms else args.iterations
-            # Build cycles that FIT in total_steps (no spike at the end)
-            Tmult = args.lr_restart_mult
-            T0 = max(int(total_steps / 15), 10)  # first cycle ~7% of total
-            cycles = []
-            T_cur, accum = T0, 0
-            while accum + T_cur <= total_steps:
-                cycles.append((accum, T_cur))
-                accum += T_cur
-                T_cur = max(int(T_cur * Tmult), 1)
-            if not cycles:
-                cycles = [(0, total_steps)]
-            # Last cycle stretches to exactly total_steps (smooth landing)
-            last_start, _ = cycles[-1]
-            cycles[-1] = (last_start, total_steps - last_start)
-            # Find which cycle this step is in
-            cycle_idx, pos_in_cycle, T_cur = 0, step, cycles[0][1]
-            for ci, (cs, cl) in enumerate(cycles):
-                if step >= cs and (ci == len(cycles)-1 or step < cycles[ci+1][0]):
-                    cycle_idx, pos_in_cycle, T_cur = ci, step - cs, cl
-                    break
-            peak = decay ** cycle_idx
-            cos_val = 0.5 * (1.0 + math.cos(math.pi * pos_in_cycle / max(T_cur, 1)))
-            return warmup_mul * peak * (min_r + (1.0 - min_r) * cos_val)
-        # Fallback: original warmdown schedule
         if args.warmdown_iters <= 0:
-            return warmup_mul
+            return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            wd = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-            return warmup_mul * wd
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        wd = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
-        return warmup_mul * wd
+        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
