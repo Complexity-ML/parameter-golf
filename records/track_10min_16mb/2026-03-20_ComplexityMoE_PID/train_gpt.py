@@ -6,6 +6,9 @@ https://github.com/Complexity-ML/complexity-framework
 
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore", message="Online softmax is disabled")
+
 import copy
 import glob
 import io
