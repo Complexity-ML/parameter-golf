@@ -615,7 +615,6 @@ class TokenRoutedMLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, num_experts: int,
                  activation: str = "relu2"):
         super().__init__()
-        assert num_experts == 2, "Sort-and-split dispatch requires exactly 2 experts"
         self.num_experts, self.dim, self.activation = num_experts, dim, activation
         self.expert_inter = (mlp_mult * dim) // num_experts
         self.fc_weight = nn.Parameter(torch.empty(num_experts, dim, self.expert_inter))
@@ -629,23 +628,23 @@ class TokenRoutedMLP(nn.Module):
     def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
         bsz, seq, _ = x.shape
         N = bsz * seq
-        half = N // 2
-        flat_x = x.reshape(N, self.dim)           # [N, D]
-        flat_ids = expert_ids.reshape(N)           # [N]
+        chunk = N // self.num_experts
+        flat_x = x.reshape(N, self.dim)             # [N, D]
+        flat_ids = expert_ids.reshape(N)             # [N]
         # Sort by expert_id — all shapes static
-        sort_idx = flat_ids.argsort(stable=True)   # [N]
-        sorted_x = flat_x[sort_idx]                # [N, D]
-        # Fixed split: expert 0 gets first half, expert 1 gets second half
-        # Overflow tokens from one expert are redirected to the other
-        x_0 = sorted_x[:half]                      # [N/2, D] — static
-        x_1 = sorted_x[half:]                      # [N/2, D] — static
-        # Both experts compute in parallel (torch.compile fuses these)
-        h_0 = torch.relu(x_0 @ self.fc_weight[0]).square()
-        out_0 = h_0 @ self.proj_weight[0]          # [N/2, D]
-        h_1 = torch.relu(x_1 @ self.fc_weight[1]).square()
-        out_1 = h_1 @ self.proj_weight[1]          # [N/2, D]
+        sort_idx = flat_ids.argsort(stable=True)     # [N]
+        sorted_x = flat_x[sort_idx]                  # [N, D]
+        # Fixed split: each expert gets exactly N/E tokens
+        # Overflow redirected to next expert — all experts always busy
+        parts = []
+        for e in range(self.num_experts):
+            start = e * chunk
+            end = start + chunk if e < self.num_experts - 1 else N
+            x_e = sorted_x[start:end]               # [N/E, D] — static
+            h = torch.relu(x_e @ self.fc_weight[e]).square()
+            parts.append(h @ self.proj_weight[e])    # [N/E, D]
         # Concatenate and unsort to restore original order
-        sorted_out = torch.cat([out_0, out_1], dim=0)  # [N, D]
+        sorted_out = torch.cat(parts, dim=0)         # [N, D]
         out = torch.zeros_like(flat_x)
         out[sort_idx] = sorted_out
         return out.reshape(bsz, seq, self.dim)
