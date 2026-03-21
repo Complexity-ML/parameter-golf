@@ -107,12 +107,6 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
 
-    # Cosine warm restarts (SGDR) scheduler
-    lr_schedule = os.environ.get("LR_SCHEDULE", _T.get("lr_schedule", "cosine_restarts"))
-    lr_restart_base_period = int(os.environ.get("LR_RESTART_BASE_PERIOD", str(_T.get("lr_restart_base_period", 5000))))
-    lr_restart_mult = float(os.environ.get("LR_RESTART_MULT", str(_T.get("lr_restart_mult", 2.0))))
-    lr_restart_decay = float(os.environ.get("LR_RESTART_DECAY", str(_T.get("lr_restart_decay", 0.7))))
-    lr_min_ratio = float(os.environ.get("LR_MIN_RATIO", str(_T.get("lr_min_ratio", 0.01))))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", str(_O.get("embed_lr", 0.6))))
