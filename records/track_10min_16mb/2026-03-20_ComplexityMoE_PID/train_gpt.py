@@ -608,16 +608,9 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
-# Soft MoE — all experts compute all tokens in parallel (one einsum),
-# soft router blends results. Zero waste, fullgraph safe, GPU saturated.
-class SoftMoERouter(nn.Module):
-    def __init__(self, dim: int, num_experts: int):
-        super().__init__()
-        self.proj = nn.Linear(dim, num_experts, bias=False)
-        nn.init.normal_(self.proj.weight, std=0.01)
-    def forward(self, x: Tensor) -> Tensor:
-        return F.softmax(self.proj(x), dim=-1)  # [bsz, seq, E]
-
+# Token-Routed MoE — modulo hard routing + parallel einsum, fullgraph safe.
+# All experts compute all tokens in one einsum (GPU saturated),
+# then modulo one-hot selects 1 expert per token (hard routing).
 class TokenRoutedMLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int, num_experts: int,
                  activation: str = "relu2"):
@@ -626,23 +619,24 @@ class TokenRoutedMLP(nn.Module):
         self.expert_inter = (mlp_mult * dim) // num_experts
         self.fc_weight = nn.Parameter(torch.empty(num_experts, dim, self.expert_inter))
         self.proj_weight = nn.Parameter(torch.empty(num_experts, self.expert_inter, dim))
-        self.router = SoftMoERouter(dim, num_experts)
         self._init_weights()
 
     def _init_weights(self):
         nn.init.kaiming_uniform_(self.fc_weight, a=5**0.5)
         nn.init.zeros_(self.proj_weight)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
         bsz, seq, _ = x.shape
         flat_x = x.reshape(-1, self.dim)  # [N, D]
-        # All experts, all tokens, one batched op — GPU fully parallel
+        # All experts, all tokens, one batched einsum — GPU fully parallel
         all_h = torch.einsum('nd,edi->nei', flat_x, self.fc_weight)   # [N, E, I]
         all_h = torch.relu(all_h).square()
         all_out = torch.einsum('nei,eid->ned', all_h, self.proj_weight)  # [N, E, D]
-        # Soft router blends expert outputs — every expert contributes
-        w = self.router(x).reshape(-1, self.num_experts)  # [N, E]
-        out = (all_out * w.unsqueeze(-1)).sum(dim=1)       # [N, D]
+        # Modulo routing: main expert = strong signal, others = recycled bonus
+        one_hot = F.one_hot(expert_ids.reshape(-1), self.num_experts).to(flat_x.dtype)  # [N, E]
+        # Main expert gets weight 1.0, others get 0.1 — zero compute wasted
+        weights = one_hot * 0.9 + 0.1 / self.num_experts  # [N, E]
+        out = (all_out * weights.unsqueeze(-1)).sum(dim=1)  # [N, D]
         return out.reshape(bsz, seq, self.dim)
 
 class Block(nn.Module):
@@ -673,7 +667,7 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor,
+    def forward(self, x: Tensor, x0: Tensor, expert_ids: Tensor,
                 q_delta_fn=None, v_delta_fn=None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -683,7 +677,7 @@ class Block(nn.Module):
         attn_out = self.attn(n, qd, vd)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         if self.use_moe:
-            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), expert_ids)
         else:
             m = self.mlp_norm(x)
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.proj(torch.relu(self.fc(m)).square())
@@ -719,6 +713,10 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.register_buffer(
+            "token_to_expert",
+            torch.arange(vocab_size, dtype=torch.long) % num_experts,
+        )
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -746,11 +744,12 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
+        expert_ids = self.token_to_expert[input_ids.clamp(0, self.vocab_size - 1)]
 
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, qd, vd)
+            x = self.blocks[i](x, x0, expert_ids, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -758,7 +757,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
             vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, qd, vd)
+            x = self.blocks[bi](x, x0, expert_ids, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
