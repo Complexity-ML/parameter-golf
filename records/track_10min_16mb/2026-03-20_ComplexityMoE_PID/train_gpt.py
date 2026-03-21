@@ -54,7 +54,6 @@ def _load_config() -> dict:
 _CFG = _load_config()
 _M = _CFG.get("model", {})
 _MOE = _CFG.get("moe", {})
-_PID = _CFG.get("pid", {})
 _T = _CFG.get("training", {})
 _O = _CFG.get("optimizer", {})
 _TTT = _CFG.get("ttt", {})
@@ -98,14 +97,6 @@ class Hyperparameters:
     moe_activation = os.environ.get("MOE_ACTIVATION", _MOE.get("activation", "swiglu"))
     moe_routing = os.environ.get("MOE_ROUTING", _MOE.get("routing", "hybrid"))
 
-    # PID Dynamics (INL Lite)
-    pid_alpha = float(os.environ.get("PID_ALPHA", str(_PID.get("alpha", 0.95))))
-    pid_beta = float(os.environ.get("PID_BETA", str(_PID.get("beta", 0.3))))
-    pid_gate = float(os.environ.get("PID_GATE", str(_PID.get("gate", 0.1))))
-    pid_dt = float(os.environ.get("PID_DT", str(_PID.get("dt", 0.1))))
-    pid_mu_min = float(os.environ.get("PID_MU_MIN", str(_PID.get("mu_min", 0.5))))
-    pid_mu_max = float(os.environ.get("PID_MU_MAX", str(_PID.get("mu_max", 1.5))))
-    pid_velocity_max = float(os.environ.get("PID_VELOCITY_MAX", str(_PID.get("velocity_max", 3.0))))
 
     # Cosine warm restarts (SGDR) scheduler
     lr_schedule = os.environ.get("LR_SCHEDULE", _T.get("lr_schedule", "cosine_restarts"))
@@ -115,20 +106,20 @@ class Hyperparameters:
     lr_min_ratio = float(os.environ.get("LR_MIN_RATIO", str(_T.get("lr_min_ratio", 0.01))))
 
     # Optimizer hyperparameters.
-    embed_lr = float(os.environ.get("EMBED_LR", 0.6))
-    head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    embed_lr = float(os.environ.get("EMBED_LR", str(_O.get("embed_lr", 0.6))))
+    head_lr = float(os.environ.get("HEAD_LR", str(_O.get("head_lr", 0.008))))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", str(_O.get("tied_embed_lr", 0.05))))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    beta1 = float(os.environ.get("BETA1", 0.9))
-    beta2 = float(os.environ.get("BETA2", 0.95))
-    adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    matrix_lr = float(os.environ.get("MATRIX_LR", str(_O.get("matrix_lr", 0.04))))
+    scalar_lr = float(os.environ.get("SCALAR_LR", str(_O.get("scalar_lr", 0.04))))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", str(_O.get("muon_momentum", 0.95))))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", str(_O.get("muon_backend_steps", 5))))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", str(_O.get("muon_momentum_warmup_start", 0.85))))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", str(_O.get("muon_momentum_warmup_steps", 500))))
+    beta1 = float(os.environ.get("BETA1", str(_O.get("beta1", 0.9))))
+    beta2 = float(os.environ.get("BETA2", str(_O.get("beta2", 0.95))))
+    adam_eps = float(os.environ.get("ADAM_EPS", str(_O.get("adam_eps", 1e-8))))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", str(_O.get("grad_clip_norm", 0.0))))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", str(_O.get("weight_decay", 0.04))))
 
     # Test-time training (LoRA) hyperparameters.
@@ -617,25 +608,17 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
-# Mu Dynamics — learnable equilibrium per layer, no velocity overhead.
-class MuDynamics(nn.Module):
-    def __init__(self, dim: int, mu_min: float = 0.5, mu_max: float = 1.5):
-        super().__init__()
-        self.mu_min, self.mu_max = mu_min, mu_max
-        self.mu = nn.Parameter(torch.full((dim,), (mu_min + mu_max) / 2.0))
-
-    def forward(self, h: Tensor) -> Tensor:
-        mu = self.mu.clamp(self.mu_min, self.mu_max).to(dtype=h.dtype)
-        return h + 0.02 * (mu[None, None, :] - h)
-
 # Learned Hash Router — Linear(H, E) micro-router, fullgraph safe.
+# Detached input: router learns to cluster representations without polluting backbone gradients.
 class LearnedHashRouter(nn.Module):
     def __init__(self, dim: int, num_experts: int):
         super().__init__()
         self.proj = nn.Linear(dim, num_experts, bias=False)
         nn.init.normal_(self.proj.weight, std=0.01)
     def forward(self, x: Tensor) -> Tensor:
-        return F.softmax(self.proj(x), dim=-1)
+        """Returns expert_ids (long), same shape as x[..., 0]."""
+        logits = self.proj(x.detach())
+        return logits.argmax(dim=-1)
 
 # Token-Routed MoE — routing: "modulo" | "learned" | "hybrid" (modulo + learned override)
 class TokenRoutedMLP(nn.Module):
@@ -662,21 +645,20 @@ class TokenRoutedMLP(nn.Module):
             nn.init.zeros_(self.proj_weight)
 
     def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
+        """expert_ids: (bsz, seq) long — hard routing from LearnedHashRouter."""
         bsz, seq, _ = x.shape
         flat_x = x.reshape(-1, self.dim)
-        # Mask multiply: fullgraph=True safe, torch.compile unrolls the loop
         flat_ids = expert_ids.reshape(-1)
-        weights = F.one_hot(flat_ids, self.num_experts).to(flat_x.dtype)
         out = torch.zeros_like(flat_x)
         for e in range(self.num_experts):
-            w = weights[:, e].unsqueeze(-1)
+            mask = (flat_ids == e).unsqueeze(-1)  # [N, 1]
             if self.activation == "swiglu":
                 gu = flat_x @ self.gate_up_proj[e]
                 gate, up = gu.chunk(2, dim=-1)
-                out = out + (F.silu(gate) * up @ self.down_proj[e]) * w
+                out = out + (F.silu(gate) * up @ self.down_proj[e]) * mask
             else:
                 h = torch.relu(flat_x @ self.fc_weight[e])
-                out = out + (h.square() @ self.proj_weight[e]) * w
+                out = out + (h.square() @ self.proj_weight[e]) * mask
         return out.reshape(bsz, seq, self.dim)
 
 class Block(nn.Module):
@@ -691,8 +673,6 @@ class Block(nn.Module):
         num_experts: int = 4,
         moe_activation: str = "swiglu",
         moe_routing: str = "hybrid",
-        mu_min: float = 0.5,
-        mu_max: float = 1.5,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -706,12 +686,11 @@ class Block(nn.Module):
             self.fc = CastedLinear(dim, hidden, bias=False)
             self.proj = CastedLinear(hidden, dim, bias=False)
             self.proj._zero_init = True
-        self.mu_dyn = MuDynamics(dim, mu_min, mu_max)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, expert_ids: Tensor,
+    def forward(self, x: Tensor, x0: Tensor,
                 q_delta_fn=None, v_delta_fn=None) -> Tensor:
         mix = self.resid_mix.clamp(0, 1).to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
@@ -720,13 +699,14 @@ class Block(nn.Module):
         vd = v_delta_fn(n) if v_delta_fn is not None else None
         attn_out = self.attn(n, qd, vd)
         x = x + self.attn_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * attn_out
-        x = self.mu_dyn(x)
         if self.use_moe:
-            x = x + self.mlp_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x), expert_ids)
+            m = self.mlp_norm(x)
+            expert_ids = self.mlp.router(m)  # hard routing, detached
+            x = x + self.mlp_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * self.mlp(m, expert_ids)
         else:
             m = self.mlp_norm(x)
             x = x + self.mlp_scale.clamp(0, 2).to(dtype=x.dtype)[None, None, :] * self.proj(torch.relu(self.fc(m)).square())
-        return x.clamp(-10, 10)  # float camouflage: keep activations int-friendly
+        return x
 
 class GPT(nn.Module):
     def __init__(
@@ -745,8 +725,6 @@ class GPT(nn.Module):
         num_experts: int = 4,
         moe_activation: str = "swiglu",
         moe_routing: str = "hybrid",
-        pid_mu_min: float = 0.5,
-        pid_mu_max: float = 1.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -761,17 +739,11 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        # Token → expert mapping (deterministic base for modulo/hybrid routing)
-        self.register_buffer(
-            "token_to_expert",
-            torch.arange(vocab_size, dtype=torch.long) % num_experts,
-        )
         self.blocks = nn.ModuleList(
             [
                 Block(
                     model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                     num_experts, moe_activation, moe_routing,
-                    pid_mu_min, pid_mu_max,
                 )
                 for i in range(num_layers)
             ]
@@ -794,13 +766,11 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
-        # Compute expert routing from input token IDs (deterministic, zero cost)
-        expert_ids = self.token_to_expert[input_ids.clamp(0, self.vocab_size - 1)]
 
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, expert_ids, qd, vd)
+            x = self.blocks[i](x, x0, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -808,7 +778,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].clamp(0, 2).to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
             vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, expert_ids, qd, vd)
+            x = self.blocks[bi](x, x0, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
@@ -1132,8 +1102,6 @@ def main() -> None:
         num_experts=args.num_experts,
         moe_activation=args.moe_activation,
         moe_routing=args.moe_routing,
-        pid_mu_min=args.pid_mu_min,
-        pid_mu_max=args.pid_mu_max,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1155,21 +1123,12 @@ def main() -> None:
         p
         for name, p in block_named_params
         if (p.ndim == 2 or p.ndim == 3) and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        and "pid" not in name
     ]
     scalar_params = [
         p
         for name, p in block_named_params
         if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
-        and "pid" not in name
     ]
-    # PID mu params (1D, learnable) go to scalar optimizer
-    pid_params = [
-        p
-        for name, p in block_named_params
-        if "pid" in name and p.requires_grad
-    ]
-    scalar_params.extend(pid_params)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
