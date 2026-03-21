@@ -616,14 +616,17 @@ class LearnedHashRouter(nn.Module):
         self.proj = nn.Linear(dim, num_experts, bias=False)
         nn.init.normal_(self.proj.weight, std=0.01)
     def forward(self, x: Tensor) -> Tensor:
-        """Returns expert_ids (long), same shape as x[..., 0].
-        Straight-through: gradients flow through soft probs to router + backbone."""
+        """Returns STE one-hot (bsz, seq, E).
+        Straight-through: forward uses hard argmax, backward uses soft sigmoid/softmax."""
         logits = self.proj(x)
-        soft = F.softmax(logits, dim=-1)
+        if self.proj.out_features == 2:
+            # 2 experts: sigmoid avoids softmax inductor warning
+            p = torch.sigmoid(logits[:, 0:1] - logits[:, 1:2]) if logits.ndim == 2 else torch.sigmoid(logits[..., 0:1] - logits[..., 1:2])
+            soft = torch.cat([p, 1.0 - p], dim=-1)
+        else:
+            soft = F.softmax(logits, dim=-1)
         hard = F.one_hot(logits.argmax(dim=-1), self.proj.out_features).to(soft.dtype)
-        # STE: forward uses hard (argmax), backward uses soft (differentiable)
-        one_hot = (hard - soft).detach() + soft
-        return one_hot
+        return (hard - soft).detach() + soft
 
 # Token-Routed MoE — routing: "modulo" | "learned" | "hybrid" (modulo + learned override)
 class TokenRoutedMLP(nn.Module):
