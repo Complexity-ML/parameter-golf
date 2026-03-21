@@ -12,7 +12,7 @@
     "tied_embed_init_std": 0.005,
     "logit_softcap": 30.0,
     "rope_base": 10000.0,
-    "classical_layers": "0,1,2",
+    "classical_layers": "0,1,2,3,4",
     "quant_bits": 8
   },
 
@@ -49,8 +49,8 @@
     "beta1": 0.9,
     "beta2": 0.95,
     "adam_eps": 1e-8,
-    "grad_clip_norm": 0.0,
-    "weight_decay": 0.0
+    "grad_clip_norm": 0.3,
+    "weight_decay": 0.02
   },
 
   "ttt": {
