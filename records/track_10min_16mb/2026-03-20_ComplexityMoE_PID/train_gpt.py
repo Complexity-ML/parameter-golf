@@ -577,15 +577,14 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        # Routed Q/K/V/O projections: [E, in, out] — sort-and-split dispatch
+        # Routed Q/O: [E, in, out] — sort-and-split, expert-specific
         self.c_q_w = nn.Parameter(torch.empty(num_experts, dim, dim))
-        self.c_k_w = nn.Parameter(torch.empty(num_experts, dim, kv_dim))
-        self.c_v_w = nn.Parameter(torch.empty(num_experts, dim, kv_dim))
         self.proj_w = nn.Parameter(torch.empty(num_experts, dim, dim))
         nn.init.kaiming_uniform_(self.c_q_w, a=5**0.5)
-        nn.init.kaiming_uniform_(self.c_k_w, a=5**0.5)
-        nn.init.kaiming_uniform_(self.c_v_w, a=5**0.5)
         nn.init.zeros_(self.proj_w)
+        # Shared K/V: single weight set — compatible attention across all experts
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -608,10 +607,10 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, sort_idx: Tensor, q_delta=None, v_delta=None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        # Routed Q/K/V projections
+        # Routed Q, shared K/V
         q = self._routed_proj(x, self.c_q_w, sort_idx) + (q_delta if q_delta is not None else 0)
-        k = self._routed_proj(x, self.c_k_w, sort_idx)
-        v = self._routed_proj(x, self.c_v_w, sort_idx) + (v_delta if v_delta is not None else 0)
+        k = self.c_k(x)
+        v = self.c_v(x) + (v_delta if v_delta is not None else 0)
         # Full-sequence attention (all tokens interact)
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
