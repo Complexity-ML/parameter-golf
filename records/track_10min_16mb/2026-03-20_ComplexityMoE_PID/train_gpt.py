@@ -1182,16 +1182,23 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
+    lr_warmup_steps = 50  # linear ramp 0 → peak over 50 steps
+
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        # Linear warmup
+        warmup = min(step / lr_warmup_steps, 1.0) if lr_warmup_steps > 0 else 1.0
+        # Linear warmdown
         if args.warmdown_iters <= 0:
-            return 1.0
+            return warmup
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+            wd = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        else:
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            wd = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        return warmup * wd
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1290,12 +1297,20 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
-        # Decoupled weight decay (keeps weights small for better int6 quantization)
+        # Decoupled weight decay
         if args.weight_decay > 0:
             with torch.no_grad():
                 for p in base_model.parameters():
                     if p.ndim >= 2:
                         p.mul_(1.0 - args.weight_decay * scale * args.matrix_lr)
+        # QAT: fake quantize (STE) — model learns to tolerate int8
+        if step > 200:  # let model stabilize first
+            with torch.no_grad():
+                for p in base_model.parameters():
+                    if p.ndim >= 2 and p.numel() > 256:
+                        amax = p.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+                        s = amax / QUANT_MAX
+                        p.copy_(torch.round(p / s).clamp(-QUANT_MAX, QUANT_MAX) * s)
         zero_grad_all()
 
         step += 1
