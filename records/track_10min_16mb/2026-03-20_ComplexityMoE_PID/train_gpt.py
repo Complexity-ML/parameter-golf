@@ -645,20 +645,23 @@ class TokenRoutedMLP(nn.Module):
             nn.init.zeros_(self.proj_weight)
 
     def forward(self, x: Tensor, expert_ids: Tensor) -> Tensor:
-        """expert_ids: (bsz, seq) long — hard routing from router."""
+        """expert_ids: (bsz, seq) long — hard routing, gather/scatter dispatch."""
         bsz, seq, _ = x.shape
         flat_x = x.reshape(-1, self.dim)
         flat_ids = expert_ids.reshape(-1)
         out = torch.zeros_like(flat_x)
         for e in range(self.num_experts):
-            mask = (flat_ids == e).unsqueeze(-1)  # [N, 1]
+            idx = (flat_ids == e).nonzero(as_tuple=True)[0]
+            if idx.numel() == 0:
+                continue
+            x_e = flat_x[idx]  # [n_e, dim] — only tokens for this expert
             if self.activation == "swiglu":
-                gu = flat_x @ self.gate_up_proj[e]
+                gu = x_e @ self.gate_up_proj[e]
                 gate, up = gu.chunk(2, dim=-1)
-                out = out + (F.silu(gate) * up @ self.down_proj[e]) * mask
+                out[idx] = F.silu(gate) * up @ self.down_proj[e]
             else:
-                h = torch.relu(flat_x @ self.fc_weight[e])
-                out = out + (h.square() @ self.proj_weight[e]) * mask
+                h = torch.relu(x_e @ self.fc_weight[e])
+                out[idx] = h.square() @ self.proj_weight[e]
         return out.reshape(bsz, seq, self.dim)
 
 class Block(nn.Module):
@@ -1109,7 +1112,7 @@ def main() -> None:
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
