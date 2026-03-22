@@ -581,6 +581,8 @@ class BetaMuAttention(nn.Module):
         self.mu = nn.Parameter(torch.zeros(num_heads, self.head_dim))
         # Error gate: sigmoid(-β * ||x - μ||) — stable tokens pass, unstable gated
         self.beta = nn.Parameter(torch.ones(num_heads))
+        # Query gate: per-position content-dependent gating (pairwise-ish)
+        self.q_proj = CastedLinear(dim, dim, bias=False)
         # Causal conv1d per head — local context mixing, fully parallel
         self.conv_k = 64
         self.conv = nn.Conv1d(dim, dim, kernel_size=self.conv_k, padding=self.conv_k - 1,
@@ -590,6 +592,8 @@ class BetaMuAttention(nn.Module):
 
     def forward(self, x: Tensor, attn_delta=None) -> Tensor:
         bsz, seq_len, _ = x.shape
+        # Query gate: each position decides what to keep from context
+        q = torch.sigmoid(self.q_proj(x))  # [bsz, seq, dim]
         # Causal conv1d: mix local context
         h = x.transpose(1, 2)  # [bsz, dim, seq]
         h = self.conv(h)[:, :, :seq_len]  # causal: trim future
@@ -598,9 +602,10 @@ class BetaMuAttention(nn.Module):
         x_heads = x.view(bsz, seq_len, self.num_heads, self.head_dim)
         error_mag = (x_heads - self.mu).norm(dim=-1)  # [bsz, seq, H]
         gate = torch.sigmoid(-F.softplus(self.beta) * error_mag)  # [bsz, seq, H]
-        # Apply gate per head
+        # Apply both gates: query (position-dependent) * error (stability)
         h_heads = h.view(bsz, seq_len, self.num_heads, self.head_dim)
-        out = (gate.unsqueeze(-1) * h_heads).reshape(bsz, seq_len, self.dim)
+        q_heads = q.view(bsz, seq_len, self.num_heads, self.head_dim)
+        out = (q_heads * gate.unsqueeze(-1) * h_heads).reshape(bsz, seq_len, self.dim)
         out = self.out_proj(out)
         return out + (attn_delta if attn_delta is not None else 0)
 
