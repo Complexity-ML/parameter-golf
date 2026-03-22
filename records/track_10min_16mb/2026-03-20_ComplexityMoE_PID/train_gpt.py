@@ -583,6 +583,8 @@ class BetaMuAttention(nn.Module):
             CastedLinear(dim, 64, bias=False), nn.SiLU(),
             CastedLinear(64, num_heads, bias=False), nn.Softplus(),
         )
+        # Init β higher (~1.0) so INL differentiates tokens from the start
+        nn.init.constant_(self.beta_proj[2].weight, 0.3)
         # ALiBi decay per head — learned slope for positional weighting
         self.alibi_slope = nn.Parameter(torch.zeros(num_heads))
         self.out_proj = CastedLinear(dim, dim, bias=False)
