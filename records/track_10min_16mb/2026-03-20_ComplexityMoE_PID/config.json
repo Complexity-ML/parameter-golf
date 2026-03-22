@@ -5,14 +5,14 @@
   "model": {
     "vocab_size": 1024,
     "num_layers": 9,
-    "model_dim": 448,
+    "model_dim": 480,
     "num_heads": 8,
     "num_kv_heads": 4,
     "tie_embeddings": true,
     "tied_embed_init_std": 0.005,
     "logit_softcap": 30.0,
     "rope_base": 10000.0,
-    "classical_layers": "0,1,2",
+    "classical_layers": "0,1,2,3,4",
     "quant_bits": 8
   },
 
