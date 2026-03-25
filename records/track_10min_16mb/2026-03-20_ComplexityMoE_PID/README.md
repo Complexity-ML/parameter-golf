@@ -1,76 +1,68 @@
-# Partitioned MoE + PID + BigramHash + SmearGate + SlidingWindow + Int5/Int6
+# Partitioned MoE + PID + BigramHash + Int5/Int6 + SlidingWindow
 
 **Author:** Boris Peyriguere (Complexity-ML)
 **Date:** 2026-03-20
 **Score:** Pending (awaiting compute credits)
 
+---
+
 ## Summary
 
-Architecture combining **hash-partitioned MoE**, **PID dynamics**, and all proven leaderboard techniques from the [Complexity Framework](https://github.com/Complexity-ML/complexity-framework):
+Novel submission combining **partition-based isolation** (inspired by `sha256(api_key:user_id) % 64` security partitioning) with proven leaderboard techniques to push BPB as low as possible under the 16MB / 10min constraint.
 
-1. **Per-Layer Hash Routing** — `hash(layer_id, token_id) = (token_id * 36313) ^ (layer_id * 27191) % E`. Each layer routes tokens to different experts, breaking co-activation bias.
+- **Per-layer hash routing** — `(token_id × 36313) ⊕ (layer_id × 27191) % E`
+  Deterministic, zero-overhead. Each layer routes tokens to different experts, breaking co-activation bias vs flat `token_id % E`. No two layers share the same token-expert affinity.
 
-2. **Layer Partitioning** — 3 partitions with different budgets:
-   - **P0 (layers 0-2):** Classical GQA, 2 experts, MLP 2x — input features
-   - **P1 (layers 3-5):** INL BetaMu, 4 experts, MLP 3x — max capacity
-   - **P2 (layers 6-8):** Classical GQA, 4 experts, MLP 2x — output precision
+- **Layer budget partitioning** — 3 tiers
+  P0 (input: 2 experts, MLP 2×) · P1 (middle: 4 experts, MLP 3×) · P2 (output: 4 experts, MLP 2×)
+  Parameters allocated where marginal BPB gain is highest.
 
-3. **PID Dynamics (INL BetaMu)** — Error-gated causal conv1d with learnable equilibrium `mu`. Layers 3-5 use INL, rest uses classical GQA with RoPE.
+- **INL BetaMu PID dynamics**
+  Error-gated causal conv1d with learnable equilibrium μ on middle layers (3–5).
+  Classical GQA with RoPE on input/output (0–2, 6–8).
 
-4. **BigramHash(10240) + SmearGate** — Hash consecutive token pairs into 10240-bucket embedding table (dim=128), projected to model_dim. SmearGate blends each token with its predecessor.
+- **BigramHash(10240) + SmearGate**
+  Hash consecutive token pairs into a 10240-bucket learned embedding (dim=128) + previous-token gating.
 
-5. **Sliding Window Eval** (stride=64) — Overlapping windows score only the last `stride` tokens, increasing effective context. Extracted into `eval_sliding.py`.
+- **Int5/Int6 mixed quantization**
+  Int5 [-16, 15] for MLP (1.88× zstd ratio) · Int6 [-32, 31] for attention · FP16 for tied embeddings.
+  3% magnitude pruning before compression.
 
-6. **Int5/Int6 Mixed Quantization** — Int5 for MLP weights (better zstd compression), Int6 for attention (precision-sensitive), FP16 for embeddings. + 3% magnitude pruning before quant.
+- **Sliding window eval** (stride=64, window=2048)
+  Extracted to standalone `eval_sliding.py`.
 
-7. **SWA** (start_frac=0.4) — Stochastic Weight Averaging over the last 40% of warmdown, every 50 steps.
+- **SWA** start_frac=0.4 (last 40% warmdown, every 50 steps)
+  **Muon momentum** 0.99 · **WD** 0.04 · **seq_len** 2048 · **model_dim** 512 · **batch** 786K tokens
 
-8. **Test-Time Training (LoRA)** — Per-document LoRA adaptation at eval time.
+- **LoRA TTT** — rank-8 per-document test-time training at eval
+
+---
 
 ## Architecture
 
 ```
-Input -> Embedding + BigramHash(10240) -> RMSNorm -> SmearGate -> [Block x 9] -> FinalNorm -> LM Head
+Embedding + BigramHash(10240) → RMSNorm → SmearGate → [Block × 9] → FinalNorm → LM Head
 
-Partitions:
-  P0 (layers 0-2): GQA attention,  2 experts, MLP 2x   [input]
-  P1 (layers 3-5): INL BetaMu,     4 experts, MLP 3x   [middle]
-  P2 (layers 6-8): GQA attention,  4 experts, MLP 2x   [output]
+P0 (layers 0-2):  GQA (RoPE),     2 experts, MLP 2×   ← input partition
+P1 (layers 3-5):  INL BetaMu,     4 experts, MLP 3×   ← middle partition (max capacity)
+P2 (layers 6-8):  GQA (RoPE),     4 experts, MLP 2×   ← output partition
 
-Block:
-  ResidMix -> Attention -> AttnScale -> MLP(TokenRoutedMoE) -> MLPScale
-  U-Net skip connections between encoder/decoder halves
-
-MoE routing per layer:
-  expert_id = ((token_id * 36313) ^ (layer_id * 27191)) % num_experts_for_layer
+U-Net skip connections · Sort-and-split MoE dispatch · fullgraph-safe
 ```
 
-## Key Hyperparameters
-
-| Param | Value |
-|-------|-------|
-| model_dim | 512 |
-| num_layers | 9 (4 encoder + 5 decoder) |
-| num_heads / kv_heads | 8 / 4 (GQA) |
-| train_seq_len | 2048 |
-| train_batch_tokens | 786K |
-| Muon momentum | 0.99 (warmup 0.92 over 1500 steps) |
-| Weight decay | 0.04 |
-| Warmdown | 3000 iters |
-| Eval stride | 64 (sliding window) |
-| Quantization | Int5 MLP + Int6 attn + FP16 embed |
-| SWA | start_frac=0.4, every 50 steps |
-| Pruning | 3% magnitude before quant |
+---
 
 ## Files
 
 | File | Description |
 |------|-------------|
 | `train_gpt.py` | Training script (1435 lines, under 1500 limit) |
-| `eval_sliding.py` | Sliding window eval (standalone or imported) |
+| `eval_sliding.py` | Sliding window eval (standalone or imported by train) |
 | `config.json` | All hyperparameters |
 | `i64_moe_kernel.cu` | Optional CUDA kernel for MoE dispatch |
 | `submission.json` | Submission metadata |
+
+---
 
 ## How to Run
 
@@ -86,6 +78,18 @@ RUN_ID=partition_v2 torchrun --standalone --nproc_per_node=8 \
 MODEL_PATH=final_model.int8.ptz python3 \
   records/track_10min_16mb/2026-03-20_ComplexityMoE_PID/eval_sliding.py
 ```
+
+---
+
+## Test Plan
+
+- [ ] Verify training completes in <10min on 8xH100
+- [ ] Confirm artifact size <16MB after int5/int6+zstd-22
+- [ ] Run 3 seeds, report mean±std (p < 0.01)
+- [ ] Validate val_bpb with sliding window eval (stride=64)
+- [ ] Verify quantization roundtrip integrity
+
+---
 
 ## Status
 
