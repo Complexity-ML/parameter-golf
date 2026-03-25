@@ -1,4 +1,4 @@
-# Complexity MoE + PID Dynamics
+# Partitioned MoE + PID + BigramHash + SmearGate + SlidingWindow + Int5/Int6
 
 **Author:** Boris Peyriguere (Complexity-ML)
 **Date:** 2026-03-20
@@ -6,48 +6,85 @@
 
 ## Summary
 
-Novel architecture combining innovations from the [Complexity Framework](https://github.com/Complexity-ML/complexity-framework):
+Architecture combining **hash-partitioned MoE**, **PID dynamics**, and all proven leaderboard techniques from the [Complexity Framework](https://github.com/Complexity-ML/complexity-framework):
 
-1. **Token-Routed MoE** — 4 experts with deterministic routing (`token_id % 4`). Zero-overhead, perfectly balanced, no auxiliary loss needed. Mask-multiply pattern for `torch.compile(fullgraph=True)` compatibility.
+1. **Per-Layer Hash Routing** — `hash(layer_id, token_id) = (token_id * 36313) ^ (layer_id * 27191) % E`. Each layer routes tokens to different experts, breaking co-activation bias.
 
-2. **PID Dynamics (INL Ultra-Lite)** — Learnable equilibrium `mu` traverses all 9 layers. Fixed alpha/beta/gate with tight clamping (mu ∈ [0.5, 1.5], velocity ∈ [-3, 3]). Stabilises hidden state trajectories like a PID controller.
+2. **Layer Partitioning** — 3 partitions with different budgets:
+   - **P0 (layers 0-2):** Classical GQA, 2 experts, MLP 2x — input features
+   - **P1 (layers 3-5):** INL BetaMu, 4 experts, MLP 3x — max capacity
+   - **P2 (layers 6-8):** Classical GQA, 4 experts, MLP 2x — output precision
 
-3. **SwiGLU Activation** — Replaces relu² from baseline. Gate+up fused projection per expert.
+3. **PID Dynamics (INL BetaMu)** — Error-gated causal conv1d with learnable equilibrium `mu`. Layers 3-5 use INL, rest uses classical GQA with RoPE.
 
-4. **Cosine Warm Restarts (SGDR)** — LR schedule with increasing cycle lengths (5k/10k/20k steps). Peak LR decays 0.7× each restart. Drives PPL lower than linear warmdown.
+4. **BigramHash(10240) + SmearGate** — Hash consecutive token pairs into 10240-bucket embedding table (dim=128), projected to model_dim. SmearGate blends each token with its predecessor.
+
+5. **Sliding Window Eval** (stride=64) — Overlapping windows score only the last `stride` tokens, increasing effective context. Extracted into `eval_sliding.py`.
+
+6. **Int5/Int6 Mixed Quantization** — Int5 for MLP weights (better zstd compression), Int6 for attention (precision-sensitive), FP16 for embeddings. + 3% magnitude pruning before quant.
+
+7. **SWA** (start_frac=0.4) — Stochastic Weight Averaging over the last 40% of warmdown, every 50 steps.
+
+8. **Test-Time Training (LoRA)** — Per-document LoRA adaptation at eval time.
 
 ## Architecture
 
 ```
-Input → Embedding → RMSNorm → [Block × 9] → Final Norm → LM Head
+Input -> Embedding + BigramHash(10240) -> RMSNorm -> SmearGate -> [Block x 9] -> FinalNorm -> LM Head
+
+Partitions:
+  P0 (layers 0-2): GQA attention,  2 experts, MLP 2x   [input]
+  P1 (layers 3-5): INL BetaMu,     4 experts, MLP 3x   [middle]
+  P2 (layers 6-8): GQA attention,  4 experts, MLP 2x   [output]
 
 Block:
-  ResidMix → Attention(GQA) → PID(h, v) → RMSNorm → TokenRoutedMLP(4 experts)
-                                  ↕
-                           mu, velocity traverse all layers
+  ResidMix -> Attention -> AttnScale -> MLP(TokenRoutedMoE) -> MLPScale
+  U-Net skip connections between encoder/decoder halves
+
+MoE routing per layer:
+  expert_id = ((token_id * 36313) ^ (layer_id * 27191)) % num_experts_for_layer
 ```
 
-## Parameters
+## Key Hyperparameters
 
-- **14.7M params** (same budget as baseline ~5.3M attention + ~9.4M MLP)
-- Under 16MB after int8+zlib compression
-- Config-driven via `config.json` for deterministic reproducibility
+| Param | Value |
+|-------|-------|
+| model_dim | 512 |
+| num_layers | 9 (4 encoder + 5 decoder) |
+| num_heads / kv_heads | 8 / 4 (GQA) |
+| train_seq_len | 2048 |
+| train_batch_tokens | 786K |
+| Muon momentum | 0.99 (warmup 0.92 over 1500 steps) |
+| Weight decay | 0.04 |
+| Warmdown | 3000 iters |
+| Eval stride | 64 (sliding window) |
+| Quantization | Int5 MLP + Int6 attn + FP16 embed |
+| SWA | start_frac=0.4, every 50 steps |
+| Pruning | 3% magnitude before quant |
 
-## Key Differences from Baseline
+## Files
 
-| Aspect | Baseline | This Submission |
-|--------|----------|----------------|
-| MLP | Dense relu² | Token-Routed 4× SwiGLU experts |
-| Routing | N/A | `token_id % 4` (deterministic) |
-| Dynamics | None | PID (mu across all layers) |
-| LR Schedule | Linear warmdown | Cosine warm restarts (SGDR) |
-| Activation | relu² | SwiGLU |
+| File | Description |
+|------|-------------|
+| `train_gpt.py` | Training script (1435 lines, under 1500 limit) |
+| `eval_sliding.py` | Sliding window eval (standalone or imported) |
+| `config.json` | All hyperparameters |
+| `i64_moe_kernel.cu` | Optional CUDA kernel for MoE dispatch |
+| `submission.json` | Submission metadata |
 
 ## How to Run
 
 ```bash
+# Download data
 python3 data/cached_challenge_fineweb.py --variant sp1024
-RUN_ID=complexity_v1 torchrun --standalone --nproc_per_node=8 train_gpt.py
+
+# Train (8xH100)
+RUN_ID=partition_v2 torchrun --standalone --nproc_per_node=8 \
+  records/track_10min_16mb/2026-03-20_ComplexityMoE_PID/train_gpt.py
+
+# Standalone sliding window eval
+MODEL_PATH=final_model.int8.ptz python3 \
+  records/track_10min_16mb/2026-03-20_ComplexityMoE_PID/eval_sliding.py
 ```
 
 ## Status
