@@ -679,14 +679,16 @@ class TokenRoutedMLP(nn.Module):
             expert_ids = self.token_to_expert[ids]
         else:
             expert_ids = torch.zeros(N, dtype=torch.long, device=x.device)
-        # BMM dispatch: each token selects its expert
-        sel_gate = self.gate_w[expert_ids]  # [N, dim, hidden]
-        sel_up = self.up_w[expert_ids]
-        sel_down = self.down_w[expert_ids]
-        g = torch.bmm(flat.unsqueeze(1), sel_gate.to(flat.dtype)).squeeze(1)
-        u = torch.bmm(flat.unsqueeze(1), sel_up.to(flat.dtype)).squeeze(1)
-        inter = F.silu(g) * u
-        routed = torch.bmm(inter.unsqueeze(1), sel_down.to(flat.dtype)).squeeze(1)
+        # Sparse dispatch: loop over experts (memory-efficient)
+        routed = torch.zeros_like(flat)
+        for e in range(self.num_experts):
+            mask = expert_ids == e
+            if not mask.any():
+                continue
+            x_e = flat[mask]
+            g = F.linear(x_e, self.gate_w[e].to(x_e.dtype).T)
+            u = F.linear(x_e, self.up_w[e].to(x_e.dtype).T)
+            routed[mask] = F.linear(F.silu(g) * u, self.down_w[e].to(x_e.dtype).T)
         # Shared expert
         shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
         out = (routed + shared).reshape(bsz, seq_len, dim)
