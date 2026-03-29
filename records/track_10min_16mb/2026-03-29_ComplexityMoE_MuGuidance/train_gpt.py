@@ -679,14 +679,14 @@ class TokenRoutedMLP(nn.Module):
             expert_ids = self.token_to_expert[ids]
         else:
             expert_ids = torch.zeros(N, dtype=torch.long, device=x.device)
-        # Fused gate+up into single [E, dim, 2*hidden], then BMM dispatch
-        gate_up = torch.cat([self.gate_w, self.up_w], dim=-1)  # [E, dim, 2*hidden]
-        sel_gu = gate_up[expert_ids]  # [N, dim, 2*hidden]
-        gu = torch.bmm(flat.unsqueeze(1), sel_gu.to(flat.dtype)).squeeze(1)  # [N, 2*hidden]
-        hidden = self.gate_w.shape[2]
-        inter = F.silu(gu[..., :hidden]) * gu[..., hidden:]
-        sel_down = self.down_w[expert_ids]  # [N, hidden, dim]
-        routed = torch.bmm(inter.unsqueeze(1), sel_down.to(flat.dtype)).squeeze(1)  # [N, dim]
+        # BMM dispatch: separate gate/up to avoid XBLOCK overflow
+        sel_gate = self.gate_w[expert_ids]  # [N, dim, hidden]
+        sel_up = self.up_w[expert_ids]
+        g = torch.bmm(flat.unsqueeze(1), sel_gate.to(flat.dtype)).squeeze(1)
+        u = torch.bmm(flat.unsqueeze(1), sel_up.to(flat.dtype)).squeeze(1)
+        inter = F.silu(g) * u
+        sel_down = self.down_w[expert_ids]
+        routed = torch.bmm(inter.unsqueeze(1), sel_down.to(flat.dtype)).squeeze(1)
         # Shared expert
         shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
         out = (routed + shared).reshape(bsz, seq_len, dim)
