@@ -655,17 +655,19 @@ class TokenRoutedMLP(nn.Module):
         self.num_experts = num_experts
         self.vocab_size = vocab_size
         expert_hidden = (mlp_mult * dim) // num_experts
-        # Expert weights: [E, dim, hidden] and [E, hidden, dim]
-        self.gate_w = nn.Parameter(torch.randn(num_experts, dim, expert_hidden) * 0.02)
-        self.up_w = nn.Parameter(torch.randn(num_experts, dim, expert_hidden) * 0.02)
-        self.down_w = nn.Parameter(torch.randn(num_experts, expert_hidden, dim) * 0.02)
-        nn.init.zeros_(self.down_w)
+        self.expert_hidden = expert_hidden
+        # Separate Linear per expert (torch.compile friendly, no dynamic indexing)
+        self.expert_gates = nn.ModuleList([CastedLinear(dim, expert_hidden, bias=False) for _ in range(num_experts)])
+        self.expert_ups = nn.ModuleList([CastedLinear(dim, expert_hidden, bias=False) for _ in range(num_experts)])
+        self.expert_downs = nn.ModuleList([CastedLinear(expert_hidden, dim, bias=False) for _ in range(num_experts)])
+        for d in self.expert_downs:
+            d._zero_init = True
         # Shared expert (same size as one expert)
         self.shared_gate = CastedLinear(dim, expert_hidden, bias=False)
         self.shared_up = CastedLinear(dim, expert_hidden, bias=False)
         self.shared_down = CastedLinear(expert_hidden, dim, bias=False)
         self.shared_down._zero_init = True
-        # Default modulo routing (overwritten by Zipf if token_frequencies provided)
+        # Default modulo routing
         self.register_buffer("token_to_expert",
                              torch.arange(vocab_size, dtype=torch.long) % num_experts)
 
@@ -679,14 +681,14 @@ class TokenRoutedMLP(nn.Module):
             expert_ids = self.token_to_expert[ids]
         else:
             expert_ids = torch.zeros(N, dtype=torch.long, device=x.device)
-        # BMM dispatch: separate gate/up to avoid XBLOCK overflow
-        sel_gate = self.gate_w[expert_ids]  # [N, dim, hidden]
-        sel_up = self.up_w[expert_ids]
-        g = torch.bmm(flat.unsqueeze(1), sel_gate.to(flat.dtype)).squeeze(1)
-        u = torch.bmm(flat.unsqueeze(1), sel_up.to(flat.dtype)).squeeze(1)
-        inter = F.silu(g) * u
-        sel_down = self.down_w[expert_ids]
-        routed = torch.bmm(inter.unsqueeze(1), sel_down.to(flat.dtype)).squeeze(1)
+        # One-hot dispatch: compute all experts, mask by assignment
+        one_hot = F.one_hot(expert_ids, self.num_experts).to(flat.dtype)  # [N, E]
+        routed = torch.zeros(N, dim, device=flat.device, dtype=flat.dtype)
+        for e in range(self.num_experts):
+            g = self.expert_gates[e](flat)
+            u = self.expert_ups[e](flat)
+            d = self.expert_downs[e](F.silu(g) * u)
+            routed = routed + one_hot[:, e:e+1] * d
         # Shared expert
         shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
         out = (routed + shared).reshape(bsz, seq_len, dim)
