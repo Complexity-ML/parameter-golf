@@ -681,14 +681,18 @@ class TokenRoutedMLP(nn.Module):
             expert_ids = self.token_to_expert[ids]
         else:
             expert_ids = torch.zeros(N, dtype=torch.long, device=x.device)
-        # One-hot dispatch: compute all experts, mask by assignment
-        one_hot = F.one_hot(expert_ids, self.num_experts).to(flat.dtype)  # [N, E]
+        # Sparse dispatch with torch.where (fullgraph safe, no wasted compute)
         routed = torch.zeros(N, dim, device=flat.device, dtype=flat.dtype)
+        zeros_h = torch.zeros(N, self.expert_hidden, device=flat.device, dtype=flat.dtype)
+        zeros_d = torch.zeros(N, dim, device=flat.device, dtype=flat.dtype)
         for e in range(self.num_experts):
-            g = self.expert_gates[e](flat)
-            u = self.expert_ups[e](flat)
+            mask = (expert_ids == e).unsqueeze(-1)  # [N, 1]
+            # Only compute where mask is true (torch.where stops gradient for false branch)
+            x_masked = torch.where(mask, flat, torch.zeros_like(flat))
+            g = self.expert_gates[e](x_masked)
+            u = self.expert_ups[e](x_masked)
             d = self.expert_downs[e](F.silu(g) * u)
-            routed = routed + one_hot[:, e:e+1] * d
+            routed = routed + torch.where(mask, d, zeros_d)
         # Shared expert
         shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
         out = (routed + shared).reshape(bsz, seq_len, dim)
