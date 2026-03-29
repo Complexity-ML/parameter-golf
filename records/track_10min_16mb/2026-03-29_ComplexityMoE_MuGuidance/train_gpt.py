@@ -54,18 +54,18 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -77,7 +77,8 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -85,6 +86,11 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -603,6 +609,45 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+class SmearGate(nn.Module):
+    """Blend each token with the previous token (free bigram context)."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash consecutive token pairs into a learned embedding table."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
 class TokenRoutedMLP(nn.Module):
     """Token-Routed MoE with SwiGLU experts + shared expert."""
     def __init__(self, dim: int, mlp_mult: int, num_experts: int = 4, vocab_size: int = 1024):
@@ -756,6 +801,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHashEmbedding(10240, 128, model_dim)
+        self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -790,10 +837,36 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Forward pass returning logits (for sliding window eval)."""
+        bsz, seq_len = input_ids.shape
+        x = self.tok_emb(input_ids) + self.bigram(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
+        x0 = x
+        skips: list[Tensor] = []
+        mu_prev = self.mu_init.expand(bsz, seq_len, -1)
+        for i in range(self.num_encoder_layers):
+            x, mu_current = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
+            mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x, mu_current = self.blocks[self.num_encoder_layers + i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
+            mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        return (self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)).reshape(bsz, seq_len, -1)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         bsz, seq_len = input_ids.shape
-        x = self.tok_emb(input_ids)
+        x = self.tok_emb(input_ids) + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
         mu_prev = self.mu_init.expand(bsz, seq_len, -1)
@@ -1136,6 +1209,21 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        # Weight decay on matrix params
+        if args.weight_decay > 0:
+            with torch.no_grad():
+                for p in matrix_params:
+                    p.mul_(1.0 - args.weight_decay * scale * args.matrix_lr)
+        # SWA: accumulate weight average during warmdown phase
+        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            if not hasattr(main, '_swa_state'):
+                main._swa_state = {k: v.clone() for k, v in base_model.state_dict().items()}
+                main._swa_count = 1
+            else:
+                sd = base_model.state_dict()
+                main._swa_count += 1
+                for k in main._swa_state:
+                    main._swa_state[k] += (sd[k] - main._swa_state[k]) / main._swa_count
         zero_grad_all()
 
         step += 1
@@ -1165,10 +1253,13 @@ def main() -> None:
     )
 
     # -----------------------------
-    # SERIALIZATION + ROUNDTRIP VALIDATION
+    # SWA + SERIALIZATION
     # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    # Load SWA averaged weights if available
+    if args.swa_enabled and hasattr(main, '_swa_state'):
+        log0(f"Loading SWA weights (averaged over {main._swa_count} snapshots)")
+        base_model.load_state_dict(main._swa_state, strict=True)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
