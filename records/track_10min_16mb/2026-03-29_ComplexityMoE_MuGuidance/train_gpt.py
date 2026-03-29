@@ -1228,13 +1228,15 @@ def main() -> None:
         # SWA: accumulate weight average during warmdown phase
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
             if not hasattr(main, '_swa_state'):
-                main._swa_state = {k: v.clone() for k, v in base_model.state_dict().items()}
+                main._swa_state = {k: v.clone().float() if v.is_floating_point() else v.clone()
+                                   for k, v in base_model.state_dict().items()}
                 main._swa_count = 1
             else:
                 sd = base_model.state_dict()
                 main._swa_count += 1
                 for k in main._swa_state:
-                    main._swa_state[k] += (sd[k] - main._swa_state[k]) / main._swa_count
+                    if main._swa_state[k].is_floating_point():
+                        main._swa_state[k] += (sd[k].float() - main._swa_state[k]) / main._swa_count
         zero_grad_all()
 
         step += 1
