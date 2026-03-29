@@ -54,7 +54,7 @@ class Hyperparameters:
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -679,16 +679,14 @@ class TokenRoutedMLP(nn.Module):
             expert_ids = self.token_to_expert[ids]
         else:
             expert_ids = torch.zeros(N, dtype=torch.long, device=x.device)
-        # Sparse dispatch: loop over experts (memory-efficient)
-        routed = torch.zeros_like(flat)
-        for e in range(self.num_experts):
-            mask = expert_ids == e
-            if not mask.any():
-                continue
-            x_e = flat[mask]
-            g = F.linear(x_e, self.gate_w[e].to(x_e.dtype).T)
-            u = F.linear(x_e, self.up_w[e].to(x_e.dtype).T)
-            routed[mask] = F.linear(F.silu(g) * u, self.down_w[e].to(x_e.dtype).T)
+        # Fused gate+up into single [E, dim, 2*hidden], then BMM dispatch
+        gate_up = torch.cat([self.gate_w, self.up_w], dim=-1)  # [E, dim, 2*hidden]
+        sel_gu = gate_up[expert_ids]  # [N, dim, 2*hidden]
+        gu = torch.bmm(flat.unsqueeze(1), sel_gu.to(flat.dtype)).squeeze(1)  # [N, 2*hidden]
+        hidden = self.gate_w.shape[2]
+        inter = F.silu(gu[..., :hidden]) * gu[..., hidden:]
+        sel_down = self.down_w[expert_ids]  # [N, hidden, dim]
+        routed = torch.bmm(inter.unsqueeze(1), sel_down.to(flat.dtype)).squeeze(1)  # [N, dim]
         # Shared expert
         shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
         out = (routed + shared).reshape(bsz, seq_len, dim)
