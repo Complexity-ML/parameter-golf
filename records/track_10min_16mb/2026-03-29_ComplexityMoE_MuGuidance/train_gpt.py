@@ -1094,24 +1094,27 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
-    # 5% cosine warmup + cosine decay with warmdown
-    lr_warmup_steps = max(1, int(args.iterations * 0.05))
+    # Warmup 10 steps then wallclock-based warmdown
+    lr_warmup_steps = 10
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        # Phase 1: cosine warmup over first 5% of steps
+        # Phase 1: linear warmup (fast, 10 steps)
         if step < lr_warmup_steps:
-            return 0.5 * (1.0 - math.cos(math.pi * step / lr_warmup_steps))
-        # Phase 2: cosine decay
-        progress = (step - lr_warmup_steps) / max(args.iterations - lr_warmup_steps, 1)
-        cosine_mul = 0.5 * (1.0 + math.cos(math.pi * progress))
-        # Phase 3: wallclock warmdown (overrides if near time limit)
-        if args.warmdown_iters > 0 and max_wallclock_ms is not None:
-            step_ms = elapsed_ms / max(step, 1)
-            warmdown_ms = args.warmdown_iters * step_ms
-            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-            if remaining_ms <= warmdown_ms:
-                return min(cosine_mul, remaining_ms / max(warmdown_ms, 1e-9))
-        return cosine_mul
+            return (step + 1) / lr_warmup_steps
+        # Phase 2: wallclock-based warmdown
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wallclock_ms is None:
+            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
+            if warmdown_start <= step < args.iterations:
+                return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
+            return 1.0
+        step_ms = elapsed_ms / max(step, 1)
+        warmdown_ms = args.warmdown_iters * step_ms
+        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+        if remaining_ms <= warmdown_ms:
+            return remaining_ms / max(warmdown_ms, 1e-9)
+        return 1.0
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
