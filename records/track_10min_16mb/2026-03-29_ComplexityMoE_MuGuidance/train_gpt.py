@@ -675,25 +675,29 @@ class TokenRoutedMLP(nn.Module):
         bsz, seq_len, dim = x.shape
         flat = x.reshape(-1, dim)
         N = flat.shape[0]
+        E = self.num_experts
+        chunk = N // E  # tokens per expert (equal split)
         # Routing
         if token_ids is not None:
             ids = token_ids.reshape(-1).clamp(0, self.vocab_size - 1)
             expert_ids = self.token_to_expert[ids]
         else:
             expert_ids = torch.zeros(N, dtype=torch.long, device=x.device)
-        # Sparse dispatch with torch.where (fullgraph safe, no wasted compute)
-        routed = torch.zeros(N, dim, device=flat.device, dtype=flat.dtype)
-        zeros_h = torch.zeros(N, self.expert_hidden, device=flat.device, dtype=flat.dtype)
-        zeros_d = torch.zeros(N, dim, device=flat.device, dtype=flat.dtype)
-        for e in range(self.num_experts):
-            mask = (expert_ids == e).unsqueeze(-1)  # [N, 1]
-            # Only compute where mask is true (torch.where stops gradient for false branch)
-            x_masked = torch.where(mask, flat, torch.zeros_like(flat))
-            g = self.expert_gates[e](x_masked)
-            u = self.expert_ups[e](x_masked)
-            d = self.expert_downs[e](F.silu(g) * u)
-            routed = routed + torch.where(mask, d, zeros_d)
-        # Shared expert
+        # Sort-and-split dispatch: sort tokens by expert, process chunks via bmm
+        sort_idx = expert_ids.argsort(stable=True)
+        sorted_x = flat[sort_idx]  # [N, dim]
+        # Process each expert's chunk (fixed size N/E, no dynamic shapes)
+        sorted_out = torch.zeros_like(sorted_x)
+        for e in range(E):
+            s, t = e * chunk, (e + 1) * chunk
+            x_e = sorted_x[s:t]
+            g = self.expert_gates[e](x_e)
+            u = self.expert_ups[e](x_e)
+            sorted_out[s:t] = self.expert_downs[e](F.silu(g) * u)
+        # Unsort back to original order
+        routed = torch.zeros_like(flat)
+        routed[sort_idx] = sorted_out
+        # Shared expert (all tokens)
         shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
         out = (routed + shared).reshape(bsz, seq_len, dim)
         return out
