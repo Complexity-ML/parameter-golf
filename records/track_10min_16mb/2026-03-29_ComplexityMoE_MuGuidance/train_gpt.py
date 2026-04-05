@@ -91,6 +91,14 @@ class Hyperparameters:
     ema_start_step = int(os.environ.get("EMA_START_STEP", 500))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -116,47 +124,23 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class MuonTRExpert(torch.optim.Optimizer):
-    """MuonTR for 3D expert weights [E, H, I]: per-expert Newton-Schulz orthogonalization."""
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
-        super().__init__(
-            params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
-        )
-
+    """MuonTR: per-expert [H,I] Newton-Schulz on 3D weights [E,H,I]."""
+    def __init__(self, params, lr, momentum, backend_steps, nesterov=True):
+        super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
         for group in self.param_groups:
-            lr = group["lr"]
-            momentum = group["momentum"]
-            backend_steps = group["backend_steps"]
-            nesterov = group["nesterov"]
-
+            lr, mom, ns, nest = group["lr"], group["momentum"], group["backend_steps"], group["nesterov"]
             for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad  # [E, H, I]
+                if p.grad is None: continue
+                g = p.grad
                 state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if nesterov:
-                    g = g.add(buf, alpha=momentum)
-
-                # Per-expert orthogonalization: each [H, I] slice independently
-                num_experts = g.shape[0]
-                for e in range(num_experts):
-                    g_e = g[e]  # [H, I]
-                    g_e = zeropower_via_newtonschulz5(g_e, steps=backend_steps)
-                    g_e *= max(1, g_e.size(0) / g_e.size(1)) ** 0.5
-                    p.data[e].add_(g_e, alpha=-lr)
-
-        return loss
+                if "mb" not in state: state["mb"] = torch.zeros_like(g)
+                buf = state["mb"]; buf.mul_(mom).add_(g)
+                if nest: g = g.add(buf, alpha=mom)
+                for e in range(g.shape[0]):
+                    ge = zeropower_via_newtonschulz5(g[e], steps=ns)
+                    p.data[e].add_(ge * max(1, ge.size(0) / ge.size(1)) ** 0.5, alpha=-lr)
 
 
 class Muon(torch.optim.Optimizer):
@@ -356,30 +340,11 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-# Standard int8 quantization with zstd compression
 INT8_QRANGE = 127
-# Use zstd for better compression (requires pyzstd)
 try:
-    import zstandard as zstd
-    HAS_ZSTD = True
+    import zstandard as zstd; HAS_ZSTD = True
 except ImportError:
-    try:
-        import pyzstd
-        HAS_ZSTD = True
-        # Shim to match zstandard API
-        class zstd:
-            @staticmethod
-            def ZstdCompressor(level=22):
-                class _C:
-                    def compress(self, data): return pyzstd.compress(data, level)
-                return _C()
-            @staticmethod
-            def ZstdDecompressor():
-                class _D:
-                    def decompress(self, data): return pyzstd.decompress(data)
-                return _D()
-    except ImportError:
-        HAS_ZSTD = False
+    HAS_ZSTD = False
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -1000,6 +965,82 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# TEST-TIME TRAINING (TTT)
+# -----------------------------
+
+def eval_val_sliding_ttt(args, base_model, rank, world_size, device, val_tokens,
+                         base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                         stride, batch_seqs=32, log0=print):
+    """Legal score-first TTT: score chunk, then train on it."""
+    S, T, ttt_chunk = args.train_seq_len, val_tokens.numel() - 1, args.ttt_chunk_tokens
+    ws_list = [w for w in range(0, T, stride) if min(w + S, T) - w >= stride or w == 0]
+    nc = (T + ttt_chunk - 1) // ttt_chunk
+    cw: list[list[int]] = [[] for _ in range(nc)]
+    for w in ws_list:
+        s = 0 if w == 0 else max(min(w + S, T) - w - stride, 0)
+        cw[min((w + s) // ttt_chunk, nc - 1)].append(w)
+    log0(f"ttt:start chunks={nc} lr={args.ttt_lr} epochs={args.ttt_epochs}")
+    ls = torch.zeros((), device=device, dtype=torch.float64)
+    tc = torch.zeros((), device=device, dtype=torch.float64)
+    bc = torch.zeros((), device=device, dtype=torch.float64)
+    frozen = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
+    tp = [p for n, p in base_model.named_parameters()
+          if not any(f"blocks.{b}." in n for b in frozen) and p.requires_grad_(True) is not None]
+    for n, p in base_model.named_parameters():
+        if any(f"blocks.{b}." in n for b in frozen): p.requires_grad_(False)
+    opt = torch.optim.SGD(tp, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    for ci in range(nc):
+        if not cw[ci]: continue
+        cs, ce = ci * ttt_chunk, min((ci + 1) * ttt_chunk, T)
+        mw = cw[ci][(len(cw[ci]) * rank) // world_size:(len(cw[ci]) * (rank + 1)) // world_size]
+        base_model.eval()
+        with torch.inference_mode():
+            for bi in range(0, len(mw), batch_seqs):
+                bw = mw[bi:bi + batch_seqs]; bsz = len(bw)
+                xb = torch.zeros(bsz, S, dtype=torch.int64, device=device)
+                yb = torch.zeros(bsz, S, dtype=torch.int64, device=device)
+                wl = []
+                for i, w in enumerate(bw):
+                    e = min(w + S, T); wl.append(e - w)
+                    ct = val_tokens[w:e + 1].to(dtype=torch.int64, device=device)
+                    xb[i, :e-w] = ct[:-1]; yb[i, :e-w] = ct[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    lo = base_model.forward_logits(xb)
+                nll = F.cross_entropy(lo.reshape(-1, lo.size(-1)).float(), yb.reshape(-1), reduction="none").reshape(bsz, S)
+                for i, w in enumerate(bw):
+                    s = 0 if w == 0 else max(wl[i] - stride, 0)
+                    ls += nll[i, s:wl[i]].to(torch.float64).sum(); tc += float(wl[i] - s)
+                    tgt, prev = yb[i, s:wl[i]], xb[i, s:wl[i]]
+                    bc += (base_bytes_lut[tgt].to(torch.float64) + (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)).sum()
+        if ci < nc - 1 and args.ttt_epochs > 0:
+            base_model.train(); ns = (ce - cs) // S
+            if ns > 0:
+                for pg in opt.param_groups: pg['lr'] = args.ttt_lr * 0.5 * (1 + math.cos(math.pi * ci / max(nc - 1, 1)))
+                ms, me = (ns * rank) // world_size, (ns * (rank + 1)) // world_size
+                for _ in range(args.ttt_epochs):
+                    for b in range(0, me - ms, args.ttt_batch_seqs):
+                        st = cs + (ms + b) * S; et = cs + (ms + min(b + args.ttt_batch_seqs, me - ms)) * S + 1
+                        if et > val_tokens.numel(): continue
+                        loc = val_tokens[st:et].to(device=device, dtype=torch.int64)
+                        opt.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            base_model(loc[:-1].reshape(-1, S), loc[1:].reshape(-1, S)).backward()
+                        if world_size > 1:
+                            for p in tp:
+                                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        torch.nn.utils.clip_grad_norm_(tp, args.ttt_grad_clip); opt.step()
+        if rank == 0 and (ci % 10 == 0 or ci == nc - 1):
+            rl = ls.item() / max(tc.item(), 1)
+            log0(f"  ttt [{ci+1}/{nc}] bpb={rl / math.log(2) * (tc.item() / max(bc.item(), 1)):.6f}")
+    if dist.is_available() and dist.is_initialized():
+        for t in (ls, tc, bc): dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = (ls / tc).item(); vb = vl / math.log(2) * (tc.item() / bc.item())
+    for p in base_model.parameters(): p.requires_grad_(True)
+    base_model.eval()
+    log0(f"ttt:done val_loss={vl:.6f} val_bpb={vb:.6f}"); return vl, vb
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -1432,6 +1473,16 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # TTT: test-time training on quantized model
+    if args.ttt_enabled:
+        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+            args, base_model, rank, world_size, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs, log0=log0,
+        )
+        log0(f"final_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f}")
+        log0(f"final_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
