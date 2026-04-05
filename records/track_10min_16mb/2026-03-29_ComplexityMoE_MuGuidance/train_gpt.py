@@ -145,7 +145,7 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    g = p.grad
+                    g = p.grad * world_size  # undo DDP averaging for Muon
                     state = self.state[p]
                     if "momentum_buffer" not in state: state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]; buf.mul_(mom).add_(g)
