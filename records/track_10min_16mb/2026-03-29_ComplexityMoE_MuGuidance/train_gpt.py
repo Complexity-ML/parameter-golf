@@ -123,85 +123,82 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
-class MuonTRExpert(torch.optim.Optimizer):
-    """MuonTR: per-expert [H,I] Newton-Schulz on 3D [E,H,I]. DDP handles grad sync."""
-    def __init__(s, params, lr, momentum, backend_steps, nesterov=True):
+class ParallelMuon(torch.optim.Optimizer):
+    """Parallel Muon: reduce-scatter → local NS5 → all-gather. No DDP needed.
+    Handles both 2D matrix params AND 3D expert [E,H,I] params (MuonTR)."""
+    def __init__(self, params, lr, momentum, backend_steps, nesterov=True):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
-    @torch.no_grad()
-    def step(s, closure=None):
-        for g in s.param_groups:
-            lr, mom, ns, nest = g["lr"], g["momentum"], g["backend_steps"], g["nesterov"]
-            dd = dist.is_available() and dist.is_initialized()
-            ws = dist.get_world_size() if dd else 1
-            for p in g["params"]:
-                if p.grad is None: continue
-                gr = p.grad / ws if ws > 1 else p.grad
-                st = s.state[p]
-                if "mb" not in st: st["mb"] = torch.zeros_like(gr)
-                buf = st["mb"]; buf.mul_(mom).add_(gr)
-                if nest: gr = gr.add(buf, alpha=mom)
-                for e in range(gr.shape[0]):
-                    ge = zeropower_via_newtonschulz5(gr[e], steps=ns) * max(1, gr[e].size(0)/gr[e].size(1))**.5
-                    p.data[e].add_(ge, alpha=-lr)
-
-
-class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
-        super().__init__(
-            params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
-        )
-
+        self._built = False
+    def _build(self):
+        self._dd = dist.is_available() and dist.is_initialized()
+        self._ws = dist.get_world_size() if self._dd else 1
+        self._rk = dist.get_rank() if self._dd else 0
+        ws = self._ws
+        self._meta = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                is_expert = p.ndim == 3  # [E, H, I]
+                B = p.shape[0]; padded_B = ((B + ws - 1) // ws) * ws; shard_B = padded_B // ws
+                tail = p.shape[1:]
+                dev = p.device
+                self._meta.append({
+                    'p': p, 'B': B, 'is_expert': is_expert,
+                    'padded_grad': torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
+                    'shard': torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
+                    'shard_mom': torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
+                    'full_update': torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
+                    'scale': max(1, p.shape[-2] / p.shape[-1]) ** 0.5,
+                })
+        self._meta.sort(key=lambda m: -m['p'].numel())
+        self._built = True
+    def launch_reduce_scatters(self):
+        if not self._built: self._build()
+        if not self._dd: return
+        self._rs_futs = []
+        for m in self._meta:
+            p = m['p']
+            if p.grad is None: self._rs_futs.append(None); continue
+            pg = m['padded_grad']; pg[:m['B']].copy_(p.grad.bfloat16())
+            if pg.shape[0] > m['B']: pg[m['B']:].zero_()
+            fut = dist.reduce_scatter_tensor(m['shard'], pg, op=dist.ReduceOp.AVG, async_op=True)
+            self._rs_futs.append(fut)
     @torch.no_grad()
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
-
+        if not self._built: self._build()
         for group in self.param_groups:
-            params = group["params"]
-            if not params:
-                continue
-            lr = group["lr"]
-            momentum = group["momentum"]
-            backend_steps = group["backend_steps"]
-            nesterov = group["nesterov"]
-
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad / world_size if world_size > 1 else p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
-
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
-                curr += p.numel()
-
-        return loss
+            lr, mom, ns_steps, nest = group["lr"], group["momentum"], group["backend_steps"], group["nesterov"]
+            prev_ag, prev_m = None, None
+            sharded = self._dd and hasattr(self, '_rs_futs')
+            for i, m in enumerate(self._meta):
+                p = m['p']
+                if p.grad is None: continue
+                if prev_ag is not None:
+                    prev_ag.wait(); pp = prev_m['p']
+                    pp.add_(prev_m['full_update'][:prev_m['B']].to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
+                if sharded and self._rs_futs[i] is not None:
+                    self._rs_futs[i].wait(); g = m['shard']; buf = m['shard_mom']
+                else:
+                    g = p.grad.bfloat16()
+                    st = self.state[p]
+                    if "mb" not in st: st["mb"] = torch.zeros_like(g)
+                    buf = st["mb"]
+                buf.mul_(mom).add_(g)
+                update = g.add(buf, alpha=mom) if nest else buf
+                if m['is_expert']:
+                    # MuonTR: per-expert NS on each [H,I] slice
+                    for e in range(update.shape[0]):
+                        update[e] = zeropower_via_newtonschulz5(update[e], steps=ns_steps)
+                else:
+                    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+                if sharded:
+                    prev_ag = dist.all_gather_into_tensor(m['full_update'], update, async_op=True)
+                    prev_m = m
+                else:
+                    p.add_(update.to(dtype=p.dtype), alpha=-lr * m['scale'])
+            if prev_ag is not None:
+                prev_ag.wait(); pp = prev_m['p']
+                pp.add_(prev_m['full_update'][:prev_m['B']].to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
+            if hasattr(self, '_rs_futs'): del self._rs_futs
 
 
 # -----------------------------
@@ -1161,7 +1158,9 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True,
                                     options={"max_autotune": False})
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    # No DDP — ParallelMuon handles grad comm via reduce-scatter/all-gather,
+    # non-Muon grads are manually all-reduced before Adam steps.
+    model = compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1191,33 +1190,26 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
+    # ParallelMuon handles 2D (standard Muon) AND 3D expert (MuonTR) params
+    all_muon_params = matrix_params + expert_3d_params
+    optimizer_muon = ParallelMuon(
+        all_muon_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
     )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+    for group in optimizer_muon.param_groups: group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
+        betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
     )
-    optimizer_expert = MuonTRExpert(
-        expert_3d_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_expert.param_groups: group["base_lr"] = args.matrix_lr
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_expert]
+    # Replicated params need manual all-reduce (no DDP)
+    replicated_params = [base_model.tok_emb.weight] + scalar_params
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
         )
         optimizers.insert(1, optimizer_head)
+        replicated_params.append(base_model.lm_head.weight)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1268,8 +1260,6 @@ def main() -> None:
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
-                if distributed:
-                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
@@ -1283,8 +1273,6 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
-        if distributed:
-            model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
@@ -1349,8 +1337,6 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
-        for group in optimizer_expert.param_groups:
-            group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1358,6 +1344,12 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        # 3-phase overlapped step: reduce-scatter Muon → all-reduce Adam → step
+        optimizer_muon.launch_reduce_scatters()
+        if distributed:
+            for p in replicated_params:
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
         for opt in optimizers:
             opt.step()
         # Weight decay on matrix params
