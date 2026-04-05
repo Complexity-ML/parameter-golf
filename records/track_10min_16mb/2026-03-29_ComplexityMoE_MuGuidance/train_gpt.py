@@ -745,7 +745,7 @@ class MuGuidance(nn.Module):
         self.mu_proj._zero_init = True
 
     def forward(self, h: Tensor) -> Tensor:
-        return torch.clamp(self.mu + self.mu_proj(h), -2.0, 2.0)
+        return torch.clamp(self.mu + self.mu_proj(h), -4.0, 4.0)
 
 
 class MuGuidedAttention(CausalSelfAttention):
@@ -908,13 +908,13 @@ class GPT(nn.Module):
         mu_prev = self.mu_init.expand(bsz, seq_len, -1)
         for i in range(self.num_encoder_layers):
             x, mu_current = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
-            mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            mu_prev = torch.clamp(mu_current, -4.0, 4.0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x, mu_current = self.blocks[self.num_encoder_layers + i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
-            mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            mu_prev = torch.clamp(mu_current, -4.0, 4.0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -933,13 +933,13 @@ class GPT(nn.Module):
 
         for i in range(self.num_encoder_layers):
             x, mu_current = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
-            mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            mu_prev = torch.clamp(mu_current, -4.0, 4.0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x, mu_current = self.blocks[self.num_encoder_layers + i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
-            mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            mu_prev = torch.clamp(mu_current, -4.0, 4.0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
