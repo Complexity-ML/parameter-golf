@@ -75,7 +75,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.011))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
@@ -124,83 +124,54 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    """Parallel Muon + MuonTR. No DDP needed.
-    2D: reduce-scatter → NS on shard → all-gather.
-    3D expert: all-reduce AVG (sync) → per-expert NS on all ranks → apply."""
+    """Standard Muon for 2D params. DDP handles gradient sync."""
     def __init__(self, params, lr, momentum, backend_steps, nesterov=True):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
-        self._built = False
-    def _build(self):
-        self._dd = dist.is_available() and dist.is_initialized()
-        self._ws = dist.get_world_size() if self._dd else 1
-        ws = self._ws
-        self._banks, self._experts = [], []
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.ndim == 3:
-                    self._experts.append(p)
-                else:
-                    B = p.shape[0]; pB = ((B+ws-1)//ws)*ws; sB = pB//ws; tail = p.shape[1:]; dev = p.device
-                    self._banks.append({'p': p, 'B': B,
-                        'pg': torch.zeros(pB, *tail, device=dev, dtype=torch.bfloat16),
-                        'sh': torch.zeros(sB, *tail, device=dev, dtype=torch.bfloat16),
-                        'sm': torch.zeros(sB, *tail, device=dev, dtype=torch.bfloat16),
-                        'fu': torch.zeros(pB, *tail, device=dev, dtype=torch.bfloat16)})
-        self._banks.sort(key=lambda m: -m['p'].numel())
-        self._built = True
-    def launch_reduce_scatters(self):
-        if not self._built: self._build()
-        if not self._dd: return
-        self._rs_futs = []
-        for m in self._banks:
-            if m['p'].grad is None: self._rs_futs.append(None); continue
-            m['pg'][:m['B']].copy_(m['p'].grad.bfloat16())
-            if m['pg'].shape[0] > m['B']: m['pg'][m['B']:].zero_()
-            self._rs_futs.append(dist.reduce_scatter_tensor(m['sh'], m['pg'], op=dist.ReduceOp.AVG, async_op=True))
-        # Sync 3D expert gradients (NOT async — need full gradient before NS)
-        for p in self._experts:
-            if p.grad is not None:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
     @torch.no_grad()
     def step(self, closure=None):
-        if not self._built: self._build()
+        dd = dist.is_available() and dist.is_initialized()
+        ws = dist.get_world_size() if dd else 1; rk = dist.get_rank() if dd else 0
         for group in self.param_groups:
+            params = group["params"]
+            if not params: continue
             lr, mom, ns, nest = group["lr"], group["momentum"], group["backend_steps"], group["nesterov"]
-            sc = lambda p: max(1, p.shape[-2]/p.shape[-1])**.5
-            # 2D banks: wait RS → NS on shard → all-gather
-            prev_ag, prev_m = None, None
-            sharded = self._dd and hasattr(self, '_rs_futs')
-            for i, m in enumerate(self._banks):
-                p = m['p']
-                if p.grad is None: continue
-                if prev_ag is not None:
-                    prev_ag.wait(); prev_m['p'].add_(prev_m['fu'][:prev_m['B']].to(dtype=prev_m['p'].dtype), alpha=-lr*sc(prev_m['p']))
-                if sharded and self._rs_futs[i] is not None:
-                    self._rs_futs[i].wait(); g = m['sh']; buf = m['sm']
-                else:
-                    g = p.grad.bfloat16(); st = self.state[p]
+            total = sum(p.numel() for p in params)
+            updates = torch.zeros(total, device=params[0].device, dtype=torch.bfloat16)
+            curr = 0
+            for i, p in enumerate(params):
+                if i % ws == rk and p.grad is not None:
+                    g = p.grad; st = self.state[p]
                     if "mb" not in st: st["mb"] = torch.zeros_like(g)
-                    buf = st["mb"]
-                buf.mul_(mom).add_(g)
-                u = g.add(buf, alpha=mom) if nest else buf
-                u = zeropower_via_newtonschulz5(u, steps=ns)
-                if sharded:
-                    prev_ag = dist.all_gather_into_tensor(m['fu'], u, async_op=True); prev_m = m
-                else:
-                    p.add_(u.to(dtype=p.dtype), alpha=-lr*sc(p))
-            if prev_ag is not None:
-                prev_ag.wait(); prev_m['p'].add_(prev_m['fu'][:prev_m['B']].to(dtype=prev_m['p'].dtype), alpha=-lr*sc(prev_m['p']))
-            # 3D experts: gradient already synced, per-expert NS on every rank
-            for p in self._experts:
+                    buf = st["mb"]; buf.mul_(mom).add_(g)
+                    if nest: g = g.add(buf, alpha=mom)
+                    g = zeropower_via_newtonschulz5(g, steps=ns)
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates[curr:curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+            if dd: dist.all_reduce(updates, op=dist.ReduceOp.SUM)
+            curr = 0
+            for p in params:
+                p.add_(updates[curr:curr+p.numel()].view_as(p).to(dtype=p.dtype), alpha=-lr)
+                curr += p.numel()
+
+class MuonTRExpert(torch.optim.Optimizer):
+    """MuonTR for 3D expert [E,H,I]: per-expert NS. DDP handles gradient sync."""
+    def __init__(s, params, lr, momentum, backend_steps, nesterov=True):
+        super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
+    @torch.no_grad()
+    def step(s, closure=None):
+        for g in s.param_groups:
+            lr, mom, ns, nest = g["lr"], g["momentum"], g["backend_steps"], g["nesterov"]
+            for p in g["params"]:
                 if p.grad is None: continue
-                g = p.grad.bfloat16(); st = self.state[p]
-                if "mb" not in st: st["mb"] = torch.zeros_like(g)
-                buf = st["mb"]; buf.mul_(mom).add_(g)
-                u = g.add(buf, alpha=mom) if nest else buf
-                for e in range(u.shape[0]):
-                    u[e] = zeropower_via_newtonschulz5(u[e], steps=ns)
-                p.add_(u.to(dtype=p.dtype), alpha=-lr*sc(p))
-            if hasattr(self, '_rs_futs'): del self._rs_futs
+                gr = p.grad; st = s.state[p]
+                if "mb" not in st: st["mb"] = torch.zeros_like(gr)
+                buf = st["mb"]; buf.mul_(mom).add_(gr)
+                if nest: gr = gr.add(buf, alpha=mom)
+                for e in range(gr.shape[0]):
+                    gr[e] = zeropower_via_newtonschulz5(gr[e], steps=ns)
+                    gr[e] *= max(1, gr[e].size(0) / gr[e].size(1)) ** 0.5
+                p.add_(gr.to(dtype=p.dtype), alpha=-lr)
 
 
 # -----------------------------
@@ -1177,8 +1148,8 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True,
                                     options={"max_autotune": False})
-    # No DDP — Muon handles grad comm via reduce-scatter/all-gather + all-reduce
-    model = compiled_model
+    # DDP for gradient sync
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1208,19 +1179,22 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    # Unified Muon: 2D params get standard NS, 3D expert params get per-expert NS
-    all_muon_params = matrix_params + expert_3d_params
+    # Muon for 2D (LR 0.011), MuonTRExpert for 3D experts (LR 0.04)
     optimizer_muon = Muon(
-        all_muon_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
+        matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
     )
     for group in optimizer_muon.param_groups: group["base_lr"] = args.matrix_lr
+    expert_lr = float(os.environ.get("EXPERT_LR", 0.04))
+    optimizer_expert = MuonTRExpert(
+        expert_3d_params, lr=expert_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
+    )
+    for group in optimizer_expert.param_groups: group["base_lr"] = expert_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
     )
     # Replicated params need manual all-reduce (no DDP)
-    replicated_params = [base_model.tok_emb.weight] + scalar_params
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_expert]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1344,6 +1318,7 @@ def main() -> None:
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
+            if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
@@ -1353,8 +1328,8 @@ def main() -> None:
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        for group in optimizer_muon.param_groups: group["momentum"] = muon_momentum
+        for group in optimizer_expert.param_groups: group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1362,11 +1337,6 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        # 3-phase: Muon reduce-scatter/all-reduce → Adam all-reduce → step
-        optimizer_muon.launch_reduce_scatters()
-        if distributed:
-            for p in replicated_params:
-                if p.grad is not None: dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
         for opt in optimizers:
             opt.step()
         # Weight decay on matrix params
