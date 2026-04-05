@@ -75,7 +75,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.02))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
@@ -124,30 +124,23 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class MuonTRExpert(torch.optim.Optimizer):
-    """MuonTR: per-expert [H,I] Newton-Schulz on 3D [E,H,I]. Multi-GPU aware."""
+    """MuonTR: per-expert [H,I] Newton-Schulz on 3D [E,H,I]. DDP handles grad sync."""
     def __init__(s, params, lr, momentum, backend_steps, nesterov=True):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
     @torch.no_grad()
     def step(s, closure=None):
-        dd = dist.is_available() and dist.is_initialized()
-        ws = dist.get_world_size() if dd else 1; rk = dist.get_rank() if dd else 0
         for g in s.param_groups:
             lr, mom, ns, nest = g["lr"], g["momentum"], g["backend_steps"], g["nesterov"]
-            pp = g["params"]; uf = torch.zeros(sum(p.numel() for p in pp), device=pp[0].device, dtype=torch.bfloat16)
-            c = 0
-            for i, p in enumerate(pp):
-                if i % ws == rk and p.grad is not None:
-                    gr = p.grad / ws if ws > 1 else p.grad; st = s.state[p]
-                    if "mb" not in st: st["mb"] = torch.zeros_like(gr)
-                    buf = st["mb"]; buf.mul_(mom).add_(gr)
-                    if nest: gr = gr.add(buf, alpha=mom)
-                    for e in range(gr.shape[0]):
-                        ge = zeropower_via_newtonschulz5(gr[e], steps=ns) * max(1, gr[e].size(0)/gr[e].size(1))**.5
-                        uf[c+e*ge.numel():c+(e+1)*ge.numel()] = ge.reshape(-1)
-                c += p.numel()
-            if dd: dist.all_reduce(uf, op=dist.ReduceOp.SUM)
-            c = 0
-            for p in pp: p.data.add_(uf[c:c+p.numel()].reshape(p.shape).to(p.dtype), alpha=-lr); c += p.numel()
+            for p in g["params"]:
+                if p.grad is None: continue
+                gr = p.grad
+                st = s.state[p]
+                if "mb" not in st: st["mb"] = torch.zeros_like(gr)
+                buf = st["mb"]; buf.mul_(mom).add_(gr)
+                if nest: gr = gr.add(buf, alpha=mom)
+                for e in range(gr.shape[0]):
+                    ge = zeropower_via_newtonschulz5(gr[e], steps=ns) * max(1, gr[e].size(0)/gr[e].size(1))**.5
+                    p.data[e].add_(ge, alpha=-lr)
 
 
 class Muon(torch.optim.Optimizer):
