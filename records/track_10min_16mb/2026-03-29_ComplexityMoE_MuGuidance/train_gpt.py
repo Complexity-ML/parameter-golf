@@ -885,9 +885,6 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        # Enable XSA on last 4 layers (subtract self-value projection, causal-safe)
-        for i in range(max(0, num_layers - 4), num_layers):
-            self.blocks[i].attn.use_xsa = True
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -905,6 +902,9 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        # Enable XSA on last 4 layers (subtract self-value projection, causal-safe)
+        for i in range(max(0, num_layers - 4), num_layers):
+            self.blocks[i].attn.use_xsa = True
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
