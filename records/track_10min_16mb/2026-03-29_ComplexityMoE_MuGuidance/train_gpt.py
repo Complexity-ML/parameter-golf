@@ -341,7 +341,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-INT8_QRANGE = 127
+INT8_QRANGE = 31  # int6 range [-31, 31] — matches QAT
 try:
     import zstandard as zstd; HAS_ZSTD = True
 except ImportError:
@@ -544,11 +544,25 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def _ste_int6(w: Tensor) -> Tensor:
+    """STE fake-quantize to int6 [-31,31]. Forward=quantized, backward=straight-through."""
+    with torch.no_grad():
+        w32 = w.float(); d = -1 if w32.ndim <= 2 else 2
+        rm = w32.abs().amax(dim=d if w32.ndim >= 2 else None)
+        sc = (rm / 31.0).clamp_min(1.0 / 31.0)
+        sc = sc.unsqueeze(-1) if w32.ndim >= 2 else sc
+        wq = (torch.clamp(torch.round(w32 / sc), -31, 31) * sc).to(w.dtype)
+    return w + (wq - w).detach()
+
+_QAT_ENABLED = False
+
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if _QAT_ENABLED and self.training and w.ndim == 2:
+            w = _ste_int6(w)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -731,14 +745,17 @@ class TokenRoutedMLP(nn.Module):
         # Sort-and-split dispatch
         sort_idx = expert_ids.argsort(stable=True)
         sorted_x = flat[sort_idx]
-        # Process each expert via 3D weight matmul (cast fp32→bf16 at matmul time)
+        # Process each expert (QAT: fake-quant weights during training)
+        gw = _ste_int6(self.gate_w) if _QAT_ENABLED and self.training else self.gate_w
+        uw = _ste_int6(self.up_w) if _QAT_ENABLED and self.training else self.up_w
+        dw = _ste_int6(self.down_w) if _QAT_ENABLED and self.training else self.down_w
         sorted_out = torch.zeros_like(sorted_x)
         for e in range(E):
             s, t = e * chunk, (e + 1) * chunk
             x_e = sorted_x[s:t]
-            g = x_e @ self.gate_w[e].to(x_e.dtype)
-            u = x_e @ self.up_w[e].to(x_e.dtype)
-            sorted_out[s:t] = (leaky_relu_squared(g) * u) @ self.down_w[e].to(x_e.dtype)
+            g = x_e @ gw[e].to(x_e.dtype)
+            u = x_e @ uw[e].to(x_e.dtype)
+            sorted_out[s:t] = (leaky_relu_squared(g) * u) @ dw[e].to(x_e.dtype)
         # Unsort
         routed = torch.zeros_like(flat)
         routed[sort_idx] = sorted_out
@@ -1322,6 +1339,8 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        global _QAT_ENABLED
+        if not _QAT_ENABLED and scale < 0.15: _QAT_ENABLED = True; log0(f"qat:on step:{step}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
