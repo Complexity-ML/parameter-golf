@@ -85,7 +85,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
     ema_start_step = int(os.environ.get("EMA_START_STEP", 500))
@@ -145,7 +145,7 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    g = p.grad * world_size  # undo DDP averaging for Muon
+                    g = p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state: state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]; buf.mul_(mom).add_(g)
