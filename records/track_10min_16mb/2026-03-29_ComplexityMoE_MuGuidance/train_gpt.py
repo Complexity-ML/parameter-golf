@@ -61,7 +61,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -86,9 +86,9 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
-    swa_every = int(os.environ.get("SWA_EVERY", 50))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 500))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
@@ -113,6 +113,50 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+
+class MuonTRExpert(torch.optim.Optimizer):
+    """MuonTR for 3D expert weights [E, H, I]: per-expert Newton-Schulz orthogonalization."""
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+        super().__init__(
+            params,
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            backend_steps = group["backend_steps"]
+            nesterov = group["nesterov"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad  # [E, H, I]
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+
+                # Per-expert orthogonalization: each [H, I] slice independently
+                num_experts = g.shape[0]
+                for e in range(num_experts):
+                    g_e = g[e]  # [H, I]
+                    g_e = zeropower_via_newtonschulz5(g_e, steps=backend_steps)
+                    g_e *= max(1, g_e.size(0) / g_e.size(1)) ** 0.5
+                    p.data[e].add_(g_e, alpha=-lr)
+
+        return loss
 
 
 class Muon(torch.optim.Optimizer):
@@ -552,7 +596,14 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, partial_dims: int = 0) -> Tensor:
+    """Apply RoPE. If partial_dims > 0, only rotate first partial_dims dimensions."""
+    if partial_dims > 0 and partial_dims < x.size(-1):
+        x_rope, x_pass = x[..., :partial_dims], x[..., partial_dims:]
+        half = partial_dims // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+        return torch.cat((x_rotated, x_pass), dim=-1)
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
@@ -584,7 +635,8 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rope_dims = 16  # Partial RoPE: only rotate 16/64 dims
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -594,8 +646,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, partial_dims=self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, partial_dims=self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -648,8 +700,13 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+def leaky_relu_squared(x: Tensor, negative_slope: float = 0.5) -> Tensor:
+    """LeakyReLU² — better than SiLU for small models (PR #549)."""
+    return F.leaky_relu(x, negative_slope=negative_slope).square()
+
+
 class TokenRoutedMLP(nn.Module):
-    """Token-Routed MoE with SwiGLU experts + shared expert."""
+    """Token-Routed MoE with LeakyReLU² experts + shared expert."""
     def __init__(self, dim: int, mlp_mult: int, num_experts: int = 4, vocab_size: int = 1024):
         super().__init__()
         self.num_experts = num_experts
@@ -693,12 +750,12 @@ class TokenRoutedMLP(nn.Module):
             x_e = sorted_x[s:t]
             g = self.expert_gates[e](x_e)
             u = self.expert_ups[e](x_e)
-            sorted_out[s:t] = self.expert_downs[e](F.silu(g) * u)
+            sorted_out[s:t] = self.expert_downs[e](leaky_relu_squared(g) * u)
         # Unsort back to original order
         routed = torch.zeros_like(flat)
         routed[sort_idx] = sorted_out
         # Shared expert (all tokens)
-        shared = self.shared_down(F.silu(self.shared_gate(flat)) * self.shared_up(flat))
+        shared = self.shared_down(leaky_relu_squared(self.shared_gate(flat)) * self.shared_up(flat))
         out = (routed + shared).reshape(bsz, seq_len, dim)
         return out
 
@@ -728,7 +785,9 @@ class MuGuidedAttention(CausalSelfAttention):
         for proj in [self.mu_to_q, self.mu_to_k, self.mu_to_v]:
             nn.init.normal_(proj.weight, std=0.01)
 
-    def forward(self, x: Tensor, mu_prev: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, mu_prev: Tensor | None = None,
+                prev_k: Tensor | None = None, prev_v: Tensor | None = None,
+                use_xsa: bool = False) -> tuple[Tensor, Tensor, Tensor]:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
         k = self.c_k(x)
@@ -743,15 +802,20 @@ class MuGuidedAttention(CausalSelfAttention):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, partial_dims=self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, partial_dims=self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        # XSA: concat previous layer's KV for cross-layer attention
+        k_cur, v_cur = k, v
+        if use_xsa and prev_k is not None and prev_v is not None:
+            k = torch.cat([prev_k, k], dim=2)  # [bsz, kv_heads, 2*seqlen, head_dim]
+            v = torch.cat([prev_v, v], dim=2)
         y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=True,
+            q, k, v, attn_mask=None, is_causal=(not use_xsa or prev_k is None),
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        return self.proj(y), k_cur, v_cur
 
 
 class Block(nn.Module):
@@ -777,15 +841,19 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor, token_ids: Tensor | None = None,
-                mu_prev: Tensor | None = None) -> tuple[Tensor, Tensor]:
+                mu_prev: Tensor | None = None,
+                prev_k: Tensor | None = None, prev_v: Tensor | None = None,
+                use_xsa: bool = False) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), mu_prev=mu_prev)
+        attn_out, cur_k, cur_v = self.attn(self.attn_norm(x), mu_prev=mu_prev,
+                                            prev_k=prev_k, prev_v=prev_v,
+                                            use_xsa=use_xsa)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_out = self.mlp(self.mlp_norm(x), token_ids=token_ids)
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         mu_current = self.mu_guidance(x)
-        return x, mu_current
+        return x, mu_current, cur_k, cur_v
 
 
 class GPT(nn.Module):
@@ -815,6 +883,7 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.xsa_start = num_layers - 4  # XSA on last 4 layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -856,15 +925,23 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         mu_prev = self.mu_init.expand(bsz, seq_len, -1)
+        prev_k, prev_v = None, None
         for i in range(self.num_encoder_layers):
-            x, mu_current = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
+            use_xsa = i >= self.xsa_start
+            x, mu_current, cur_k, cur_v = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev,
+                                                           prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            prev_k, prev_v = cur_k, cur_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x, mu_current = self.blocks[self.num_encoder_layers + i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
+            layer_idx = self.num_encoder_layers + i
+            use_xsa = layer_idx >= self.xsa_start
+            x, mu_current, cur_k, cur_v = self.blocks[layer_idx](x, x0, token_ids=input_ids, mu_prev=mu_prev,
+                                                                   prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            prev_k, prev_v = cur_k, cur_v
         x = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -880,16 +957,24 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         mu_prev = self.mu_init.expand(bsz, seq_len, -1)
+        prev_k, prev_v = None, None
 
         for i in range(self.num_encoder_layers):
-            x, mu_current = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
+            use_xsa = i >= self.xsa_start
+            x, mu_current, cur_k, cur_v = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev,
+                                                           prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            prev_k, prev_v = cur_k, cur_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x, mu_current = self.blocks[self.num_encoder_layers + i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
+            layer_idx = self.num_encoder_layers + i
+            use_xsa = layer_idx >= self.xsa_start
+            x, mu_current, cur_k, cur_v = self.blocks[layer_idx](x, x0, token_ids=input_ids, mu_prev=mu_prev,
+                                                                   prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
+            prev_k, prev_v = cur_k, cur_v
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1035,7 +1120,7 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # 3D expert weights (gate_w, up_w, down_w) go into Adam, not Muon
+    # 3D expert weights (gate_w, up_w, down_w) — MuonTR per-expert orthogonalization
     expert_3d_params = [
         p
         for name, p in block_named_params
@@ -1070,11 +1155,14 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_expert = torch.optim.Adam(
-        [{"params": expert_3d_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
+    optimizer_expert = MuonTRExpert(
+        expert_3d_params,
+        lr=args.matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
     )
+    for group in optimizer_expert.param_groups:
+        group["base_lr"] = args.matrix_lr
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_expert]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -1215,6 +1303,8 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
+        for group in optimizer_expert.param_groups:
+            group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1229,18 +1319,17 @@ def main() -> None:
             with torch.no_grad():
                 for p in matrix_params:
                     p.mul_(1.0 - args.weight_decay * scale * args.matrix_lr)
-        # SWA: accumulate weight average during warmdown phase
-        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
-            if not hasattr(main, '_swa_state'):
-                main._swa_state = {k: v.clone().float() if v.is_floating_point() else v.clone()
+        # EMA: exponential moving average of weights
+        if args.ema_enabled and step >= args.ema_start_step:
+            if not hasattr(main, '_ema_state'):
+                main._ema_state = {k: v.clone().float() if v.is_floating_point() else v.clone()
                                    for k, v in base_model.state_dict().items()}
-                main._swa_count = 1
             else:
                 sd = base_model.state_dict()
-                main._swa_count += 1
-                for k in main._swa_state:
-                    if main._swa_state[k].is_floating_point():
-                        main._swa_state[k] += (sd[k].float() - main._swa_state[k]) / main._swa_count
+                decay = args.ema_decay
+                for k in main._ema_state:
+                    if main._ema_state[k].is_floating_point():
+                        main._ema_state[k].mul_(decay).add_(sd[k].float(), alpha=1 - decay)
         zero_grad_all()
 
         step += 1
@@ -1273,10 +1362,10 @@ def main() -> None:
     # SWA + SERIALIZATION
     # -----------------------------
 
-    # Load SWA averaged weights if available
-    if args.swa_enabled and hasattr(main, '_swa_state'):
-        log0(f"Loading SWA weights (averaged over {main._swa_count} snapshots)")
-        base_model.load_state_dict(main._swa_state, strict=True)
+    # Load EMA averaged weights if available
+    if args.ema_enabled and hasattr(main, '_ema_state'):
+        log0(f"Loading EMA weights (decay={args.ema_decay})")
+        base_model.load_state_dict(main._ema_state, strict=True)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")

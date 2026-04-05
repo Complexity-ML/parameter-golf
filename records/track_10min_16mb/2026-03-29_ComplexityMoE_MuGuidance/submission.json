@@ -3,6 +3,6 @@
   "github_id": "Complexity-ML",
   "date": "2026-03-29",
   "val_bpb": "pending",
-  "description": "Token-Routed MoE (4 experts, Zipf-balanced routing) + Mu-Guidance + Shared Expert + SwiGLU + Int5/Int6 QAT",
+  "description": "Token-Routed MoE (4 experts, Zipf-balanced routing) + Mu-Guidance + MuonTR (per-expert Newton-Schulz) + Shared Expert + SwiGLU + Int5/Int6 QAT",
   "framework": "https://github.com/Complexity-ML/complexity-framework"
 }

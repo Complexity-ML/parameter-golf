@@ -1,4 +1,4 @@
-# Token-Routed MoE + Mu-Guidance + Shared Expert + Zipf Routing
+# Token-Routed MoE + Mu-Guidance + MuonTR + Shared Expert + Zipf Routing
 
 **Author:** Boris Peyriguere (Complexity-ML)
 **Date:** 2026-03-29
@@ -8,9 +8,26 @@
 
 ## Summary
 
-Novel architecture combining **deterministic Token-Routed MoE** with **Mu-Guidance** (inter-layer equilibrium signal) and a **Shared Lexical Expert** for maximum parameter efficiency under the 16MB constraint.
+Novel architecture combining **deterministic Token-Routed MoE** with **Mu-Guidance** (inter-layer equilibrium signal), **MuonTR** (per-expert Newton-Schulz orthogonalization), and a **Shared Lexical Expert** for maximum parameter efficiency under the 16MB constraint.
 
 ### Key innovations
+
+- **MuonTR** -- per-expert Newton-Schulz orthogonalization (replaces Adam for expert weights)
+  Each expert's [H, I] gradient slice is orthogonalized independently, respecting different SV spectra under Zipf routing. Validated by Muon maintainer (KellerJordan/Muon#65).
+
+- **XSA (Cross-layer Self-Attention)** -- last 4 layers reuse KV from previous layer
+  Doubles effective context for deep layers at zero parameter cost.
+
+- **LeakyReLU²** -- replaces SiLU activation in MLP
+  Better gradient flow for small models (PR #549 in parameter-golf).
+
+- **Partial RoPE (16/64)** -- only first 16 dims get rotary embeddings
+  Remaining dims learn position-free representations.
+
+- **EMA** -- exponential moving average (decay=0.999) replaces SWA
+  Smoother weight averaging, starts after 500 steps.
+
+- **11 layers** -- increased from 9, enabled by better quantization
 
 - **Mu-Guidance** -- learnable equilibrium signal flowing layer-to-layer
   Each layer produces `mu_current = clamp(mu_param + mu_proj(h), -2, 2)` which biases the next layer's Q/K/V projections. Provides top-down context without recurrence cost. Ablation shows removing Mu degrades loss below dense baseline.
