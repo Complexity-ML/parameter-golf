@@ -131,9 +131,11 @@ class MuonTRExpert(torch.optim.Optimizer):
     def step(s, closure=None):
         for g in s.param_groups:
             lr, mom, ns, nest = g["lr"], g["momentum"], g["backend_steps"], g["nesterov"]
+            dd = dist.is_available() and dist.is_initialized()
+            ws = dist.get_world_size() if dd else 1
             for p in g["params"]:
                 if p.grad is None: continue
-                gr = p.grad
+                gr = p.grad / ws if ws > 1 else p.grad
                 st = s.state[p]
                 if "mb" not in st: st["mb"] = torch.zeros_like(gr)
                 buf = st["mb"]; buf.mul_(mom).add_(gr)
@@ -176,7 +178,7 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    g = p.grad
+                    g = p.grad / world_size if world_size > 1 else p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
