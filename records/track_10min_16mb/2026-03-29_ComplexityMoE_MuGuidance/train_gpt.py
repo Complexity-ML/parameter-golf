@@ -137,7 +137,7 @@ class MuonTRExpert(torch.optim.Optimizer):
             c = 0
             for i, p in enumerate(pp):
                 if i % ws == rk and p.grad is not None:
-                    gr = p.grad; st = s.state[p]
+                    gr = p.grad / ws if ws > 1 else p.grad; st = s.state[p]
                     if "mb" not in st: st["mb"] = torch.zeros_like(gr)
                     buf = st["mb"]; buf.mul_(mom).add_(gr)
                     if nest: gr = gr.add(buf, alpha=mom)
