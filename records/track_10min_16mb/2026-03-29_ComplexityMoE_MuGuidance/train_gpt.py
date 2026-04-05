@@ -124,81 +124,93 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class ParallelMuon(torch.optim.Optimizer):
-    """Parallel Muon: reduce-scatter → local NS5 → all-gather. No DDP needed.
-    Handles both 2D matrix params AND 3D expert [E,H,I] params (MuonTR)."""
+    """Parallel Muon + MuonTR. No DDP needed.
+    2D params: reduce-scatter → local NS → all-gather.
+    3D expert [E,H,I]: all-reduce AVG → per-expert NS local → apply."""
     def __init__(self, params, lr, momentum, backend_steps, nesterov=True):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
         self._built = False
     def _build(self):
         self._dd = dist.is_available() and dist.is_initialized()
         self._ws = dist.get_world_size() if self._dd else 1
-        self._rk = dist.get_rank() if self._dd else 0
         ws = self._ws
-        self._meta = []
+        self._banks, self._experts = [], []
         for group in self.param_groups:
             for p in group["params"]:
-                is_expert = p.ndim == 3  # [E, H, I]
-                B = p.shape[0]; padded_B = ((B + ws - 1) // ws) * ws; shard_B = padded_B // ws
-                tail = p.shape[1:]
-                dev = p.device
-                self._meta.append({
-                    'p': p, 'B': B, 'is_expert': is_expert,
-                    'padded_grad': torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
-                    'shard': torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
-                    'shard_mom': torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
-                    'full_update': torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
-                    'scale': max(1, p.shape[-2] / p.shape[-1]) ** 0.5,
-                })
-        self._meta.sort(key=lambda m: -m['p'].numel())
+                if p.ndim == 3:  # Expert 3D — all-reduce path
+                    self._experts.append({'p': p, 'scale': max(1, p.shape[-2]/p.shape[-1])**.5})
+                else:  # 2D — reduce-scatter path
+                    B = p.shape[0]; pB = ((B+ws-1)//ws)*ws; sB = pB//ws; tail = p.shape[1:]; dev = p.device
+                    self._banks.append({
+                        'p': p, 'B': B, 'scale': max(1, p.shape[-2]/p.shape[-1])**.5,
+                        'pg': torch.zeros(pB, *tail, device=dev, dtype=torch.bfloat16),
+                        'sh': torch.zeros(sB, *tail, device=dev, dtype=torch.bfloat16),
+                        'sm': torch.zeros(sB, *tail, device=dev, dtype=torch.bfloat16),
+                        'fu': torch.zeros(pB, *tail, device=dev, dtype=torch.bfloat16),
+                    })
+        self._banks.sort(key=lambda m: -m['p'].numel())
         self._built = True
     def launch_reduce_scatters(self):
+        """Phase 1: async reduce-scatter for 2D banks + all-reduce for 3D experts."""
         if not self._built: self._build()
         if not self._dd: return
         self._rs_futs = []
-        for m in self._meta:
+        for m in self._banks:
             p = m['p']
             if p.grad is None: self._rs_futs.append(None); continue
-            pg = m['padded_grad']; pg[:m['B']].copy_(p.grad.bfloat16())
-            if pg.shape[0] > m['B']: pg[m['B']:].zero_()
-            fut = dist.reduce_scatter_tensor(m['shard'], pg, op=dist.ReduceOp.AVG, async_op=True)
-            self._rs_futs.append(fut)
+            m['pg'][:m['B']].copy_(p.grad.bfloat16())
+            if m['pg'].shape[0] > m['B']: m['pg'][m['B']:].zero_()
+            self._rs_futs.append(dist.reduce_scatter_tensor(m['sh'], m['pg'], op=dist.ReduceOp.AVG, async_op=True))
+        self._ar_futs = []
+        for m in self._experts:
+            p = m['p']
+            if p.grad is None: self._ar_futs.append(None); continue
+            self._ar_futs.append(dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True))
     @torch.no_grad()
     def step(self, closure=None):
         if not self._built: self._build()
         for group in self.param_groups:
-            lr, mom, ns_steps, nest = group["lr"], group["momentum"], group["backend_steps"], group["nesterov"]
-            prev_ag, prev_m = None, None
+            lr, mom, ns, nest = group["lr"], group["momentum"], group["backend_steps"], group["nesterov"]
+            # --- 2D banks: reduce-scatter → NS → all-gather ---
             sharded = self._dd and hasattr(self, '_rs_futs')
-            for i, m in enumerate(self._meta):
+            prev_ag, prev_m = None, None
+            for i, m in enumerate(self._banks):
                 p = m['p']
                 if p.grad is None: continue
                 if prev_ag is not None:
                     prev_ag.wait(); pp = prev_m['p']
-                    pp.add_(prev_m['full_update'][:prev_m['B']].to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
+                    pp.add_(prev_m['fu'][:prev_m['B']].to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
                 if sharded and self._rs_futs[i] is not None:
-                    self._rs_futs[i].wait(); g = m['shard']; buf = m['shard_mom']
+                    self._rs_futs[i].wait(); g = m['sh']; buf = m['sm']
                 else:
-                    g = p.grad.bfloat16()
-                    st = self.state[p]
+                    g = p.grad.bfloat16(); st = self.state[p]
                     if "mb" not in st: st["mb"] = torch.zeros_like(g)
                     buf = st["mb"]
                 buf.mul_(mom).add_(g)
-                update = g.add(buf, alpha=mom) if nest else buf
-                if m['is_expert']:
-                    # MuonTR: per-expert NS on each [H,I] slice
-                    for e in range(update.shape[0]):
-                        update[e] = zeropower_via_newtonschulz5(update[e], steps=ns_steps)
-                else:
-                    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+                u = g.add(buf, alpha=mom) if nest else buf
+                u = zeropower_via_newtonschulz5(u, steps=ns)
                 if sharded:
-                    prev_ag = dist.all_gather_into_tensor(m['full_update'], update, async_op=True)
-                    prev_m = m
+                    prev_ag = dist.all_gather_into_tensor(m['fu'], u, async_op=True); prev_m = m
                 else:
-                    p.add_(update.to(dtype=p.dtype), alpha=-lr * m['scale'])
+                    p.add_(u.to(dtype=p.dtype), alpha=-lr * m['scale'])
             if prev_ag is not None:
                 prev_ag.wait(); pp = prev_m['p']
-                pp.add_(prev_m['full_update'][:prev_m['B']].to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
+                pp.add_(prev_m['fu'][:prev_m['B']].to(dtype=pp.dtype), alpha=-lr * prev_m['scale'])
+            # --- 3D experts: all-reduce already done, per-expert NS local ---
+            for i, m in enumerate(self._experts):
+                p = m['p']
+                if p.grad is None: continue
+                if self._dd and hasattr(self, '_ar_futs') and self._ar_futs[i] is not None:
+                    self._ar_futs[i].wait()
+                g = p.grad.bfloat16(); st = self.state[p]
+                if "mb" not in st: st["mb"] = torch.zeros_like(g)
+                buf = st["mb"]; buf.mul_(mom).add_(g)
+                u = g.add(buf, alpha=mom) if nest else buf
+                for e in range(u.shape[0]):
+                    u[e] = zeropower_via_newtonschulz5(u[e], steps=ns)
+                p.add_(u.to(dtype=p.dtype), alpha=-lr * m['scale'])
             if hasattr(self, '_rs_futs'): del self._rs_futs
+            if hasattr(self, '_ar_futs'): del self._ar_futs
 
 
 # -----------------------------
