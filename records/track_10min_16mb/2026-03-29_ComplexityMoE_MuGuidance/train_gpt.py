@@ -1120,16 +1120,11 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # 3D expert weights (gate_w, up_w, down_w) — MuonTR per-expert orthogonalization
-    expert_3d_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 3
-    ]
+    # Expert weights are 2D (ModuleList of CastedLinear) — already in matrix_params for Muon
     scalar_params = [
         p
         for name, p in block_named_params
-        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and p.ndim != 3
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1155,15 +1150,7 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_expert = MuonTRExpert(
-        expert_3d_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
-    for group in optimizer_expert.param_groups:
-        group["base_lr"] = args.matrix_lr
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_expert]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1302,8 +1289,6 @@ def main() -> None:
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
-        for group in optimizer_expert.param_groups:
             group["momentum"] = muon_momentum
 
         for opt in optimizers:
