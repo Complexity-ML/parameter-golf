@@ -637,6 +637,7 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rope_dims = 16  # Partial RoPE: only rotate 16/64 dims
         self.rotary = Rotary(self.rope_dims, base=rope_base)
+        self.use_xsa = False  # set by GPT.__init__ for deep layers
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -783,9 +784,18 @@ class MuGuidedAttention(CausalSelfAttention):
         for proj in [self.mu_to_q, self.mu_to_k, self.mu_to_v]:
             nn.init.normal_(proj.weight, std=0.01)
 
-    def forward(self, x: Tensor, mu_prev: Tensor | None = None,
-                prev_k: Tensor | None = None, prev_v: Tensor | None = None,
-                use_xsa: bool = False) -> tuple[Tensor, Tensor, Tensor]:
+    def _xsa_subtract(self, y: Tensor, v: Tensor) -> Tensor:
+        """Efficient XSA: subtract self-value projection (causal-safe).
+        y: [B, H, T, D], v: [B, Hkv, T, D]."""
+        B, H, T, D = y.shape
+        Hkv = v.size(1)
+        group = H // Hkv
+        y_g = y.reshape(B, Hkv, group, T, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(2)  # [B, Hkv, 1, T, D]
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, H, T, D)
+
+    def forward(self, x: Tensor, mu_prev: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
         k = self.c_k(x)
@@ -803,17 +813,15 @@ class MuGuidedAttention(CausalSelfAttention):
         q = apply_rotary_emb(q, cos, sin, partial_dims=self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, partial_dims=self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        # XSA: concat previous layer's KV for cross-layer attention
-        k_cur, v_cur = k, v
-        if use_xsa and prev_k is not None and prev_v is not None:
-            k = torch.cat([prev_k, k], dim=2)  # [bsz, kv_heads, 2*seqlen, head_dim]
-            v = torch.cat([prev_v, v], dim=2)
         y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=(not use_xsa or prev_k is None),
+            q, k, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # XSA: subtract self-value projection (deep layers only)
+        if self.use_xsa:
+            y = self._xsa_subtract(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y), k_cur, v_cur
+        return self.proj(y)
 
 
 class Block(nn.Module):
@@ -839,19 +847,15 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor, token_ids: Tensor | None = None,
-                mu_prev: Tensor | None = None,
-                prev_k: Tensor | None = None, prev_v: Tensor | None = None,
-                use_xsa: bool = False) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+                mu_prev: Tensor | None = None) -> tuple[Tensor, Tensor]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out, cur_k, cur_v = self.attn(self.attn_norm(x), mu_prev=mu_prev,
-                                            prev_k=prev_k, prev_v=prev_v,
-                                            use_xsa=use_xsa)
+        attn_out = self.attn(self.attn_norm(x), mu_prev=mu_prev)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp_out = self.mlp(self.mlp_norm(x), token_ids=token_ids)
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         mu_current = self.mu_guidance(x)
-        return x, mu_current, cur_k, cur_v
+        return x, mu_current
 
 
 class GPT(nn.Module):
@@ -881,7 +885,9 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.xsa_start = num_layers + 1  # XSA disabled (needs proper causal mask)
+        # Enable XSA on last 4 layers (subtract self-value projection, causal-safe)
+        for i in range(max(0, num_layers - 4), num_layers):
+            self.blocks[i].attn.use_xsa = True
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -923,23 +929,15 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         mu_prev = self.mu_init.expand(bsz, seq_len, -1)
-        prev_k, prev_v = None, None
         for i in range(self.num_encoder_layers):
-            use_xsa = i >= self.xsa_start
-            x, mu_current, cur_k, cur_v = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev,
-                                                           prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
+            x, mu_current = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
-            prev_k, prev_v = cur_k, cur_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            layer_idx = self.num_encoder_layers + i
-            use_xsa = layer_idx >= self.xsa_start
-            x, mu_current, cur_k, cur_v = self.blocks[layer_idx](x, x0, token_ids=input_ids, mu_prev=mu_prev,
-                                                                   prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
+            x, mu_current = self.blocks[self.num_encoder_layers + i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
-            prev_k, prev_v = cur_k, cur_v
         x = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -955,24 +953,16 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         mu_prev = self.mu_init.expand(bsz, seq_len, -1)
-        prev_k, prev_v = None, None
 
         for i in range(self.num_encoder_layers):
-            use_xsa = i >= self.xsa_start
-            x, mu_current, cur_k, cur_v = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev,
-                                                           prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
+            x, mu_current = self.blocks[i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
-            prev_k, prev_v = cur_k, cur_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            layer_idx = self.num_encoder_layers + i
-            use_xsa = layer_idx >= self.xsa_start
-            x, mu_current, cur_k, cur_v = self.blocks[layer_idx](x, x0, token_ids=input_ids, mu_prev=mu_prev,
-                                                                   prev_k=prev_k, prev_v=prev_v, use_xsa=use_xsa)
+            x, mu_current = self.blocks[self.num_encoder_layers + i](x, x0, token_ids=input_ids, mu_prev=mu_prev)
             mu_prev = torch.clamp(mu_current, -2.0, 2.0)
-            prev_k, prev_v = cur_k, cur_v
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
