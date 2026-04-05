@@ -356,8 +356,8 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-# Int6 quantization: 6-bit range [-31, 31] packed into int8 storage
-INT6_RANGE = 31
+# Int5 quantization: 5-bit range [-15, 15] packed into int8 storage
+INT5_RANGE = 15
 # Use zstd for better compression (requires pyzstd)
 try:
     import zstandard as zstd
@@ -393,9 +393,9 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
     return t
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    """Quantize to int6 range [-31, 31] stored in int8 for better compression."""
+    """Quantize to int5 range [-15, 15] stored in int8 for better compression."""
     t32 = t.float()
-    qmax = INT6_RANGE  # 31 for int6
+    qmax = INT5_RANGE  # 15 for int5
     if t32.ndim == 2:
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
