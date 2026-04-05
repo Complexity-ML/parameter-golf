@@ -63,7 +63,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 384))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -356,8 +356,8 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-# Int5 quantization: 5-bit range [-15, 15] packed into int8 storage
-INT5_RANGE = 15
+# Standard int8 quantization with zstd compression
+INT8_QRANGE = 127
 # Use zstd for better compression (requires pyzstd)
 try:
     import zstandard as zstd
@@ -393,9 +393,8 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
     return t
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
-    """Quantize to int5 range [-15, 15] stored in int8 for better compression."""
     t32 = t.float()
-    qmax = INT5_RANGE  # 15 for int5
+    qmax = INT8_QRANGE  # 127 for int8
     if t32.ndim == 2:
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
