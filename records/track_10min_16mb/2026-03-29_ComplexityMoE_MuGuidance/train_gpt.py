@@ -65,7 +65,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -356,6 +356,30 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+# Int6 quantization: 6-bit range [-31, 31] packed into int8 storage
+INT6_RANGE = 31
+# Use zstd for better compression (requires pyzstd)
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    try:
+        import pyzstd
+        HAS_ZSTD = True
+        # Shim to match zstandard API
+        class zstd:
+            @staticmethod
+            def ZstdCompressor(level=22):
+                class _C:
+                    def compress(self, data): return pyzstd.compress(data, level)
+                return _C()
+            @staticmethod
+            def ZstdDecompressor():
+                class _D:
+                    def decompress(self, data): return pyzstd.decompress(data)
+                return _D()
+    except ImportError:
+        HAS_ZSTD = False
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -369,24 +393,23 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
     return t
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+    """Quantize to int6 range [-31, 31] stored in int8 for better compression."""
     t32 = t.float()
+    qmax = INT6_RANGE  # 31 for int6
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
             if t32.numel()
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -qmax, qmax).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
-    # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / qmax if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -qmax, qmax).to(torch.int8).contiguous()
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -713,15 +736,16 @@ class TokenRoutedMLP(nn.Module):
         self.num_experts = num_experts
         self.vocab_size = vocab_size
         expert_hidden = (mlp_mult * dim) // num_experts
+        shared_hidden = expert_hidden  # same size as one routed expert
         self.expert_hidden = expert_hidden
         # 3D expert weights [E, dim, expert_hidden] — MuonTR per-expert NS
         self.gate_w = nn.Parameter(torch.randn(num_experts, dim, expert_hidden) * 0.02)
         self.up_w = nn.Parameter(torch.randn(num_experts, dim, expert_hidden) * 0.02)
         self.down_w = nn.Parameter(torch.zeros(num_experts, expert_hidden, dim))  # zero init
-        # Shared expert (same size as one expert)
-        self.shared_gate = CastedLinear(dim, expert_hidden, bias=False)
-        self.shared_up = CastedLinear(dim, expert_hidden, bias=False)
-        self.shared_down = CastedLinear(expert_hidden, dim, bias=False)
+        # Shared expert — full width (all tokens pass through)
+        self.shared_gate = CastedLinear(dim, shared_hidden, bias=False)
+        self.shared_up = CastedLinear(dim, shared_hidden, bias=False)
+        self.shared_down = CastedLinear(shared_hidden, dim, bias=False)
         self.shared_down._zero_init = True
         # Default modulo routing
         self.register_buffer("token_to_expert",
@@ -1363,7 +1387,10 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    if HAS_ZSTD:
+        quant_blob = zstd.ZstdCompressor(level=22).compress(quant_raw)
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1381,7 +1408,10 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    if HAS_ZSTD:
+        quant_state = torch.load(io.BytesIO(zstd.ZstdDecompressor().decompress(quant_blob_disk)), map_location="cpu")
+    else:
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
