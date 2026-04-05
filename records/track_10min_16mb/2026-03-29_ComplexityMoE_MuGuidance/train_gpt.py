@@ -706,19 +706,17 @@ def leaky_relu_squared(x: Tensor, negative_slope: float = 0.5) -> Tensor:
 
 
 class TokenRoutedMLP(nn.Module):
-    """Token-Routed MoE with LeakyReLU² experts + shared expert."""
+    """Token-Routed MoE with LeakyReLU² experts (3D tensors) + shared expert."""
     def __init__(self, dim: int, mlp_mult: int, num_experts: int = 4, vocab_size: int = 1024):
         super().__init__()
         self.num_experts = num_experts
         self.vocab_size = vocab_size
         expert_hidden = (mlp_mult * dim) // num_experts
         self.expert_hidden = expert_hidden
-        # Separate Linear per expert (torch.compile friendly, no dynamic indexing)
-        self.expert_gates = nn.ModuleList([CastedLinear(dim, expert_hidden, bias=False) for _ in range(num_experts)])
-        self.expert_ups = nn.ModuleList([CastedLinear(dim, expert_hidden, bias=False) for _ in range(num_experts)])
-        self.expert_downs = nn.ModuleList([CastedLinear(expert_hidden, dim, bias=False) for _ in range(num_experts)])
-        for d in self.expert_downs:
-            d._zero_init = True
+        # 3D expert weights [E, dim, expert_hidden] — MuonTR per-expert NS
+        self.gate_w = nn.Parameter(torch.randn(num_experts, dim, expert_hidden) * 0.02)
+        self.up_w = nn.Parameter(torch.randn(num_experts, dim, expert_hidden) * 0.02)
+        self.down_w = nn.Parameter(torch.zeros(num_experts, expert_hidden, dim))  # zero init
         # Shared expert (same size as one expert)
         self.shared_gate = CastedLinear(dim, expert_hidden, bias=False)
         self.shared_up = CastedLinear(dim, expert_hidden, bias=False)
@@ -733,25 +731,25 @@ class TokenRoutedMLP(nn.Module):
         flat = x.reshape(-1, dim)
         N = flat.shape[0]
         E = self.num_experts
-        chunk = N // E  # tokens per expert (equal split)
+        chunk = N // E
         # Routing
         if token_ids is not None:
             ids = token_ids.reshape(-1).clamp(0, self.vocab_size - 1)
             expert_ids = self.token_to_expert[ids]
         else:
             expert_ids = torch.zeros(N, dtype=torch.long, device=x.device)
-        # Sort-and-split dispatch: sort tokens by expert, process chunks via bmm
+        # Sort-and-split dispatch
         sort_idx = expert_ids.argsort(stable=True)
-        sorted_x = flat[sort_idx]  # [N, dim]
-        # Process each expert's chunk (fixed size N/E, no dynamic shapes)
+        sorted_x = flat[sort_idx]
+        # Process each expert via 3D weight matmul (cast fp32→bf16 at matmul time)
         sorted_out = torch.zeros_like(sorted_x)
         for e in range(E):
             s, t = e * chunk, (e + 1) * chunk
             x_e = sorted_x[s:t]
-            g = self.expert_gates[e](x_e)
-            u = self.expert_ups[e](x_e)
-            sorted_out[s:t] = self.expert_downs[e](leaky_relu_squared(g) * u)
-        # Unsort back to original order
+            g = x_e @ self.gate_w[e].to(x_e.dtype)
+            u = x_e @ self.up_w[e].to(x_e.dtype)
+            sorted_out[s:t] = (leaky_relu_squared(g) * u) @ self.down_w[e].to(x_e.dtype)
+        # Unsort
         routed = torch.zeros_like(flat)
         routed[sort_idx] = sorted_out
         # Shared expert (all tokens)
@@ -1120,11 +1118,12 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # Expert weights are 2D (ModuleList of CastedLinear) — already in matrix_params for Muon
+    # 3D expert weights (gate_w, up_w, down_w) — MuonTR per-expert Newton-Schulz
+    expert_3d_params = [p for name, p in block_named_params if p.ndim == 3]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and p.ndim != 3
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1150,7 +1149,15 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizer_expert = MuonTRExpert(
+        expert_3d_params,
+        lr=args.matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
+    )
+    for group in optimizer_expert.param_groups:
+        group["base_lr"] = args.matrix_lr
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_expert]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1289,6 +1296,8 @@ def main() -> None:
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
+            group["momentum"] = muon_momentum
+        for group in optimizer_expert.param_groups:
             group["momentum"] = muon_momentum
 
         for opt in optimizers:
