@@ -75,7 +75,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.011))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
@@ -1184,7 +1184,7 @@ def main() -> None:
         matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
     )
     for group in optimizer_muon.param_groups: group["base_lr"] = args.matrix_lr
-    expert_lr = float(os.environ.get("EXPERT_LR", 0.04))
+    expert_lr = float(os.environ.get("EXPERT_LR", 0.011))
     optimizer_expert = MuonTRExpert(
         expert_3d_params, lr=expert_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
     )
