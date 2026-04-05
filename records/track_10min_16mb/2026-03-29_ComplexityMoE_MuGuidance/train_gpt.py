@@ -1211,13 +1211,9 @@ def main() -> None:
         fused=True,
     )
     optimizer_expert = MuonTRExpert(
-        expert_3d_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
+        expert_3d_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps,
     )
-    for group in optimizer_expert.param_groups:
-        group["base_lr"] = args.matrix_lr
+    for group in optimizer_expert.param_groups: group["base_lr"] = args.matrix_lr
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_expert]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
